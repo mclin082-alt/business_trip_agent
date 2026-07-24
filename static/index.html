@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>商务拜访执行 Agent - Phase 0</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e6e8ec;
+    --dim: #8b909c;
+    --accent: #5b8cff;
+    --ok: #35c98f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 32px 16px;
+  }
+  .wrap { width: 100%; max-width: 720px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--dim);
+    margin-bottom: 16px;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #555;
+    transition: background 0.2s;
+  }
+  .dot.connected { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .log {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px;
+    min-height: 360px;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  .entry {
+    display: flex;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    animation: fadein 0.3s ease;
+  }
+  .entry:hover { background: #1d212b; }
+  .entry time {
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    flex-shrink: 0;
+  }
+  .entry .text { font-size: 14px; }
+  .placeholder { color: var(--dim); font-size: 13px; padding: 12px; }
+  @keyframes fadein {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>商务拜访执行 Agent</h1>
+    <div class="sub">Phase 0 · 骨架验证：网页能否实时接收后端推送的消息</div>
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="status-text">连接中…</span>
+    </div>
+    <div class="log" id="log">
+      <div class="placeholder" id="placeholder">等待后端推送消息…</div>
+    </div>
+  </div>
+
+<script>
+  const dot = document.getElementById("dot");
+  const statusText = document.getElementById("status-text");
+  const logEl = document.getElementById("log");
+  const placeholder = document.getElementById("placeholder");
+
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    dot.classList.add("connected");
+    statusText.textContent = "已连接";
+  };
+
+  ws.onclose = () => {
+    dot.classList.remove("connected");
+    statusText.textContent = "连接已断开";
+  };
+
+  ws.onerror = () => {
+    statusText.textContent = "连接出错";
+  };
+
+  ws.onmessage = (event) => {
+    if (placeholder) placeholder.remove();
+    const data = JSON.parse(event.data);
+
+    const entry = document.createElement("div");
+    entry.className = "entry";
+    entry.innerHTML = `<time>${data.time}</time><span class="text">${data.text}</span>`;
+    logEl.appendChild(entry);
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+</script>
+</body>
+</html>
