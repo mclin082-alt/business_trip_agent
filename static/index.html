@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>商务拜访执行 Agent - Phase 1</title>
+<title>商务拜访执行 Agent - Phase 2</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -12,6 +12,8 @@
     --dim: #8b909c;
     --accent: #5b8cff;
     --ok: #35c98f;
+    --warn: #e0a83c;
+    --err: #e05c5c;
     --user: #2a2f3c;
   }
   * { box-sizing: border-box; }
@@ -26,7 +28,7 @@
     min-height: 100vh;
     padding: 32px 16px;
   }
-  .wrap { width: 100%; max-width: 720px; }
+  .wrap { width: 100%; max-width: 780px; }
   h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
   .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
   .status {
@@ -43,43 +45,84 @@
     transition: background 0.2s;
   }
   .dot.connected { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+
   .log {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 8px;
-    min-height: 360px;
-    max-height: 55vh;
+    min-height: 420px;
+    max-height: 62vh;
     overflow-y: auto;
     margin-bottom: 12px;
   }
   .entry {
-    display: flex;
-    gap: 12px;
     padding: 10px 12px;
     border-radius: 8px;
-    animation: fadein 0.3s ease;
-    align-items: flex-start;
+    animation: fadein 0.25s ease;
+    margin-bottom: 2px;
   }
   .entry:hover { background: #1d212b; }
-  .entry .tag {
+  .row { display: flex; gap: 10px; align-items: flex-start; }
+  .tag {
     flex-shrink: 0;
-    font-size: 12px;
-    font-weight: 600;
-    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    padding: 3px 9px;
     border-radius: 999px;
     white-space: nowrap;
+    margin-top: 1px;
   }
-  .entry.user .tag { background: var(--user); color: var(--text); }
-  .entry.assistant .tag { background: rgba(91, 140, 255, 0.15); color: var(--accent); }
-  .entry .text { font-size: 14px; white-space: pre-wrap; line-height: 1.5; }
+  .text { font-size: 14px; white-space: pre-wrap; line-height: 1.55; }
+  pre {
+    margin: 6px 0 0 0;
+    font-size: 12.5px;
+    background: #0b0d12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    color: #b9c0cf;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* Goal */
+  .entry.goal .tag { background: var(--user); color: var(--text); }
+  .entry.goal .text { font-weight: 600; }
+
+  /* Reasoning：高亮展示，这是"决策来自现场推理"的核心证据 */
+  .entry.reasoning {
+    background: rgba(91, 140, 255, 0.08);
+    border-left: 3px solid var(--accent);
+    padding-left: 10px;
+  }
+  .entry.reasoning .tag { background: rgba(91, 140, 255, 0.2); color: var(--accent); }
+
+  /* Tool call */
+  .entry.tool_call .tag { background: rgba(224, 168, 60, 0.18); color: var(--warn); }
+
+  /* Tool result */
+  .entry.tool_result .tag { background: rgba(139, 144, 156, 0.18); color: var(--dim); }
+  .entry.tool_result.status-failed pre,
+  .entry.tool_result.status-error pre,
+  .entry.tool_result.status-over_budget pre { border-color: var(--err); }
+  .entry.tool_result.status-success pre { border-color: var(--ok); }
+
+  /* Thinking placeholder */
   .entry.thinking .text { color: var(--dim); font-style: italic; }
+
+  /* Done / Error */
+  .entry.done { border-left: 3px solid var(--ok); padding-left: 10px; }
+  .entry.done .tag { background: rgba(53, 201, 143, 0.18); color: var(--ok); }
+  .entry.error { border-left: 3px solid var(--err); padding-left: 10px; }
+  .entry.error .tag { background: rgba(224, 92, 92, 0.18); color: var(--err); }
+
   .placeholder { color: var(--dim); font-size: 13px; padding: 12px; }
-  .input-row {
-    display: flex;
-    gap: 8px;
-  }
-  #input {
+
+  .input-row { display: flex; gap: 8px; }
+  #goal {
     flex: 1;
     background: var(--panel);
     border: 1px solid var(--border);
@@ -89,8 +132,8 @@
     font-size: 14px;
     outline: none;
   }
-  #input:focus { border-color: var(--accent); }
-  #send {
+  #goal:focus { border-color: var(--accent); }
+  #start {
     background: var(--accent);
     border: none;
     border-radius: 10px;
@@ -100,7 +143,8 @@
     font-weight: 600;
     cursor: pointer;
   }
-  #send:disabled { opacity: 0.5; cursor: not-allowed; }
+  #start:disabled { opacity: 0.5; cursor: not-allowed; }
+
   @keyframes fadein {
     from { opacity: 0; transform: translateY(-4px); }
     to { opacity: 1; transform: translateY(0); }
@@ -110,17 +154,19 @@
 <body>
   <div class="wrap">
     <h1>商务拜访执行 Agent</h1>
-    <div class="sub">Phase 1 · 跑通"网页 ↔ 后端 ↔ Qwen API"最小闭环（还没有工具调用、没有循环）</div>
+    <div class="sub">Phase 2 · 核心循环骨架 —— 工具该怎么用、失败了怎么办，全部由模型现场决定，代码里没有写死的 if 分支</div>
     <div class="status">
       <span class="dot" id="dot"></span>
       <span id="status-text">连接中…</span>
     </div>
     <div class="log" id="log">
-      <div class="placeholder" id="placeholder">在下面输入一句话，点"发送"试试连通性…</div>
+      <div class="placeholder" id="placeholder">在下面输入一个目标，点"开始任务"，观察模型自己规划、遇到问题自己重新决策的过程…</div>
     </div>
     <div class="input-row">
-      <input id="input" type="text" placeholder="例如：你好，你是谁？" autocomplete="off" />
-      <button id="send">发送</button>
+      <input id="goal" type="text"
+             value="帮我订一张下周二去上海的机票，要赶上客户上午10点的会面"
+             autocomplete="off" />
+      <button id="start">开始任务</button>
     </div>
   </div>
 
@@ -129,8 +175,8 @@
   const statusText = document.getElementById("status-text");
   const logEl = document.getElementById("log");
   const placeholder = document.getElementById("placeholder");
-  const input = document.getElementById("input");
-  const sendBtn = document.getElementById("send");
+  const goalInput = document.getElementById("goal");
+  const startBtn = document.getElementById("start");
 
   let thinkingEl = null;
 
@@ -140,60 +186,91 @@
   ws.onopen = () => {
     dot.classList.add("connected");
     statusText.textContent = "已连接";
-    sendBtn.disabled = false;
+    startBtn.disabled = false;
   };
-
   ws.onclose = () => {
     dot.classList.remove("connected");
     statusText.textContent = "连接已断开";
-    sendBtn.disabled = true;
+    startBtn.disabled = true;
   };
+  ws.onerror = () => { statusText.textContent = "连接出错"; };
 
-  ws.onerror = () => {
-    statusText.textContent = "连接出错";
-  };
+  function clearThinking() {
+    if (thinkingEl) {
+      thinkingEl.remove();
+      thinkingEl = null;
+    }
+  }
 
-  function appendEntry(tagText, text, kind) {
+  function appendEntry(kind, tagText, bodyHtml) {
     if (placeholder) placeholder.remove();
     const entry = document.createElement("div");
     entry.className = `entry ${kind}`;
-    entry.innerHTML = `<span class="tag">${tagText}</span><span class="text"></span>`;
-    entry.querySelector(".text").textContent = text;
+    entry.innerHTML = `<div class="row"><span class="tag">${tagText}</span><div style="flex:1">${bodyHtml}</div></div>`;
     logEl.appendChild(entry);
     logEl.scrollTop = logEl.scrollHeight;
     return entry;
   }
 
+  function esc(s) {
+    const d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data);
 
-    if (data.type === "user_message") {
-      appendEntry("你", data.text, "user");
+    if (data.type === "goal") {
+      appendEntry("goal", "目标", `<span class="text">${esc(data.text)}</span>`);
+
     } else if (data.type === "thinking") {
-      thinkingEl = appendEntry("Qwen", "思考中…", "assistant thinking");
-    } else if (data.type === "assistant_message") {
-      if (thinkingEl) {
-        thinkingEl.classList.remove("thinking");
-        thinkingEl.querySelector(".text").textContent = data.text;
-        thinkingEl = null;
-      } else {
-        appendEntry("Qwen", data.text, "assistant");
-      }
-      sendBtn.disabled = false;
+      clearThinking();
+      thinkingEl = appendEntry("thinking", "模型", `<span class="text">思考中…</span>`);
+
+    } else if (data.type === "reasoning") {
+      clearThinking();
+      appendEntry("reasoning", "推理", `<span class="text">${esc(data.text)}</span>`);
+
+    } else if (data.type === "tool_call") {
+      clearThinking();
+      appendEntry(
+        "tool_call",
+        "调用工具",
+        `<span class="text">${esc(data.name)}</span><pre>${esc(JSON.stringify(data.arguments, null, 2))}</pre>`
+      );
+
+    } else if (data.type === "tool_result") {
+      clearThinking();
+      const status = (data.result && data.result.status) ? String(data.result.status) : "";
+      appendEntry(
+        `tool_result status-${status}`,
+        "工具返回",
+        `<span class="text">${esc(data.name)}</span><pre>${esc(JSON.stringify(data.result, null, 2))}</pre>`
+      );
+
+    } else if (data.type === "done") {
+      clearThinking();
+      appendEntry("done", "完成", `<span class="text">任务已结束（模型这一轮没有再调用任何工具）。</span>`);
+      startBtn.disabled = false;
+
+    } else if (data.type === "error") {
+      clearThinking();
+      appendEntry("error", "出错", `<span class="text">${esc(data.text)}</span>`);
+      startBtn.disabled = false;
     }
   };
 
-  function sendMessage() {
-    const text = input.value.trim();
-    if (!text || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "user_message", text }));
-    input.value = "";
-    sendBtn.disabled = true; // 等这一轮回复回来再允许下一次发送，避免并发搞乱顺序
+  function startTask() {
+    const goal = goalInput.value.trim();
+    if (!goal || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "start_task", goal }));
+    startBtn.disabled = true; // 任务跑完(done/error)才重新允许点击，避免中途并发开第二个任务
   }
 
-  sendBtn.addEventListener("click", sendMessage);
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") sendMessage();
+  startBtn.addEventListener("click", startTask);
+  goalInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") startTask();
   });
 </script>
 </body>
