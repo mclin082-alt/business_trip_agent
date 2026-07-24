@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>商务拜访执行 Agent - Phase 0</title>
+<title>商务拜访执行 Agent - Phase 1</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -12,6 +12,7 @@
     --dim: #8b909c;
     --accent: #5b8cff;
     --ok: #35c98f;
+    --user: #2a2f3c;
   }
   * { box-sizing: border-box; }
   body {
@@ -48,8 +49,9 @@
     border-radius: 12px;
     padding: 8px;
     min-height: 360px;
-    max-height: 60vh;
+    max-height: 55vh;
     overflow-y: auto;
+    margin-bottom: 12px;
   }
   .entry {
     display: flex;
@@ -57,16 +59,48 @@
     padding: 10px 12px;
     border-radius: 8px;
     animation: fadein 0.3s ease;
+    align-items: flex-start;
   }
   .entry:hover { background: #1d212b; }
-  .entry time {
-    color: var(--dim);
-    font-variant-numeric: tabular-nums;
-    font-size: 13px;
+  .entry .tag {
     flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
   }
-  .entry .text { font-size: 14px; }
+  .entry.user .tag { background: var(--user); color: var(--text); }
+  .entry.assistant .tag { background: rgba(91, 140, 255, 0.15); color: var(--accent); }
+  .entry .text { font-size: 14px; white-space: pre-wrap; line-height: 1.5; }
+  .entry.thinking .text { color: var(--dim); font-style: italic; }
   .placeholder { color: var(--dim); font-size: 13px; padding: 12px; }
+  .input-row {
+    display: flex;
+    gap: 8px;
+  }
+  #input {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+  }
+  #input:focus { border-color: var(--accent); }
+  #send {
+    background: var(--accent);
+    border: none;
+    border-radius: 10px;
+    padding: 0 20px;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #send:disabled { opacity: 0.5; cursor: not-allowed; }
   @keyframes fadein {
     from { opacity: 0; transform: translateY(-4px); }
     to { opacity: 1; transform: translateY(0); }
@@ -76,13 +110,17 @@
 <body>
   <div class="wrap">
     <h1>商务拜访执行 Agent</h1>
-    <div class="sub">Phase 0 · 骨架验证：网页能否实时接收后端推送的消息</div>
+    <div class="sub">Phase 1 · 跑通"网页 ↔ 后端 ↔ Qwen API"最小闭环（还没有工具调用、没有循环）</div>
     <div class="status">
       <span class="dot" id="dot"></span>
       <span id="status-text">连接中…</span>
     </div>
     <div class="log" id="log">
-      <div class="placeholder" id="placeholder">等待后端推送消息…</div>
+      <div class="placeholder" id="placeholder">在下面输入一句话，点"发送"试试连通性…</div>
+    </div>
+    <div class="input-row">
+      <input id="input" type="text" placeholder="例如：你好，你是谁？" autocomplete="off" />
+      <button id="send">发送</button>
     </div>
   </div>
 
@@ -91,6 +129,10 @@
   const statusText = document.getElementById("status-text");
   const logEl = document.getElementById("log");
   const placeholder = document.getElementById("placeholder");
+  const input = document.getElementById("input");
+  const sendBtn = document.getElementById("send");
+
+  let thinkingEl = null;
 
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${location.host}/ws`);
@@ -98,27 +140,61 @@
   ws.onopen = () => {
     dot.classList.add("connected");
     statusText.textContent = "已连接";
+    sendBtn.disabled = false;
   };
 
   ws.onclose = () => {
     dot.classList.remove("connected");
     statusText.textContent = "连接已断开";
+    sendBtn.disabled = true;
   };
 
   ws.onerror = () => {
     statusText.textContent = "连接出错";
   };
 
-  ws.onmessage = (event) => {
+  function appendEntry(tagText, text, kind) {
     if (placeholder) placeholder.remove();
-    const data = JSON.parse(event.data);
-
     const entry = document.createElement("div");
-    entry.className = "entry";
-    entry.innerHTML = `<time>${data.time}</time><span class="text">${data.text}</span>`;
+    entry.className = `entry ${kind}`;
+    entry.innerHTML = `<span class="tag">${tagText}</span><span class="text"></span>`;
+    entry.querySelector(".text").textContent = text;
     logEl.appendChild(entry);
     logEl.scrollTop = logEl.scrollHeight;
+    return entry;
+  }
+
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    if (data.type === "user_message") {
+      appendEntry("你", data.text, "user");
+    } else if (data.type === "thinking") {
+      thinkingEl = appendEntry("Qwen", "思考中…", "assistant thinking");
+    } else if (data.type === "assistant_message") {
+      if (thinkingEl) {
+        thinkingEl.classList.remove("thinking");
+        thinkingEl.querySelector(".text").textContent = data.text;
+        thinkingEl = null;
+      } else {
+        appendEntry("Qwen", data.text, "assistant");
+      }
+      sendBtn.disabled = false;
+    }
   };
+
+  function sendMessage() {
+    const text = input.value.trim();
+    if (!text || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "user_message", text }));
+    input.value = "";
+    sendBtn.disabled = true; // 等这一轮回复回来再允许下一次发送，避免并发搞乱顺序
+  }
+
+  sendBtn.addEventListener("click", sendMessage);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") sendMessage();
+  });
 </script>
 </body>
 </html>
