@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>商务拜访执行 Agent - Phase 2</title>
+<title>商务拜访执行 Agent - Phase 3</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -28,7 +28,7 @@
     min-height: 100vh;
     padding: 32px 16px;
   }
-  .wrap { width: 100%; max-width: 780px; }
+  .wrap { width: 100%; max-width: 1080px; }
   h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
   .sub { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
   .status {
@@ -46,13 +46,75 @@
   }
   .dot.connected { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
 
+  /* 主体：左边日志流，右边 Checklist 侧边栏 */
+  .main-row {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+  }
+  .main-col { flex: 1; min-width: 0; }
+  .side-col {
+    width: 260px;
+    flex-shrink: 0;
+    position: sticky;
+    top: 24px;
+  }
+
+  .checklist-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+  }
+  .checklist-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--dim);
+    letter-spacing: 0.02em;
+    margin-bottom: 4px;
+  }
+  .checklist-progress {
+    font-size: 12px;
+    color: var(--dim);
+    margin-bottom: 14px;
+  }
+  .checklist-progress .num { color: var(--accent); font-weight: 700; }
+  .checklist-items { list-style: none; margin: 0; padding: 0; }
+  .checklist-items li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 4px;
+    font-size: 13.5px;
+    color: var(--dim);
+    transition: color 0.2s;
+  }
+  .checklist-items li + li { border-top: 1px solid var(--border); }
+  .checklist-items li.done { color: var(--text); }
+  .check-box {
+    flex-shrink: 0;
+    width: 18px; height: 18px;
+    border-radius: 6px;
+    border: 1.5px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    transition: all 0.2s;
+  }
+  .checklist-items li.done .check-box {
+    background: var(--ok);
+    border-color: var(--ok);
+    color: #06251a;
+  }
+
   .log {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 8px;
     min-height: 420px;
-    max-height: 62vh;
+    max-height: 68vh;
     overflow-y: auto;
     margin-bottom: 12px;
   }
@@ -149,24 +211,42 @@
     from { opacity: 0; transform: translateY(-4px); }
     to { opacity: 1; transform: translateY(0); }
   }
+
+  @media (max-width: 760px) {
+    .main-row { flex-direction: column; }
+    .side-col { width: 100%; position: static; }
+  }
 </style>
 </head>
 <body>
   <div class="wrap">
     <h1>商务拜访执行 Agent</h1>
-    <div class="sub">Phase 2 · 核心循环骨架 —— 工具该怎么用、失败了怎么办，全部由模型现场决定，代码里没有写死的 if 分支</div>
+    <div class="sub">Phase 3 · 全部工具补齐 + Checklist 可视化 —— 工具该怎么用、失败了怎么办，全部由模型现场决定；Checklist 只核对客观结果，不参与决策</div>
     <div class="status">
       <span class="dot" id="dot"></span>
       <span id="status-text">连接中…</span>
     </div>
-    <div class="log" id="log">
-      <div class="placeholder" id="placeholder">在下面输入一个目标，点"开始任务"，观察模型自己规划、遇到问题自己重新决策的过程…</div>
-    </div>
-    <div class="input-row">
-      <input id="goal" type="text"
-             value="帮我订一张下周二去上海的机票，要赶上客户上午10点的会面"
-             autocomplete="off" />
-      <button id="start">开始任务</button>
+
+    <div class="main-row">
+      <div class="main-col">
+        <div class="log" id="log">
+          <div class="placeholder" id="placeholder">在下面输入一个目标，点"开始任务"，观察模型自己规划、遇到问题自己重新决策的过程…</div>
+        </div>
+        <div class="input-row">
+          <input id="goal" type="text"
+                 value="下周二安排去上海拜访客户，把事情办妥"
+                 autocomplete="off" />
+          <button id="start">开始任务</button>
+        </div>
+      </div>
+
+      <div class="side-col">
+        <div class="checklist-panel">
+          <div class="checklist-title">VERIFIER · 完成标准</div>
+          <div class="checklist-progress"><span class="num" id="checklist-done">0</span> / <span id="checklist-total">5</span> 项已完成</div>
+          <ul class="checklist-items" id="checklist-items"></ul>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -177,8 +257,42 @@
   const placeholder = document.getElementById("placeholder");
   const goalInput = document.getElementById("goal");
   const startBtn = document.getElementById("start");
+  const checklistItemsEl = document.getElementById("checklist-items");
+  const checklistDoneEl = document.getElementById("checklist-done");
+  const checklistTotalEl = document.getElementById("checklist-total");
+
+  // 默认展示的 5 项（在第一次收到后端的 checklist 消息之前先占位显示，
+  // 后端消息到达后会用真实的 key/label 覆盖，顺序以后端为准）
+  const DEFAULT_CHECKLIST_LABELS = {
+    flight: "航班已确认",
+    hotel: "酒店已确认",
+    meeting: "客户会面时间已确认",
+    calendar_sync: "日历事件已同步",
+    email: "确认邮件已发送",
+  };
 
   let thinkingEl = null;
+
+  function renderChecklist(items, labels) {
+    labels = labels || DEFAULT_CHECKLIST_LABELS;
+    items = items || {};
+    const keys = Object.keys(labels);
+    checklistItemsEl.innerHTML = "";
+    let doneCount = 0;
+    for (const key of keys) {
+      const done = !!items[key];
+      if (done) doneCount++;
+      const li = document.createElement("li");
+      li.className = done ? "done" : "";
+      li.innerHTML = `<span class="check-box">${done ? "✓" : ""}</span><span>${labels[key]}</span>`;
+      checklistItemsEl.appendChild(li);
+    }
+    checklistDoneEl.textContent = doneCount;
+    checklistTotalEl.textContent = keys.length;
+  }
+
+  // 初始渲染一份空的 Checklist，任务开始后后端会推送真实状态覆盖它
+  renderChecklist({}, DEFAULT_CHECKLIST_LABELS);
 
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${location.host}/ws`);
@@ -249,6 +363,9 @@
         `<span class="text">${esc(data.name)}</span><pre>${esc(JSON.stringify(data.result, null, 2))}</pre>`
       );
 
+    } else if (data.type === "checklist") {
+      renderChecklist(data.items, data.labels);
+
     } else if (data.type === "done") {
       clearThinking();
       appendEntry("done", "完成", `<span class="text">任务已结束（模型这一轮没有再调用任何工具）。</span>`);
@@ -264,6 +381,7 @@
   function startTask() {
     const goal = goalInput.value.trim();
     if (!goal || ws.readyState !== WebSocket.OPEN) return;
+    renderChecklist({}, DEFAULT_CHECKLIST_LABELS); // 新任务开始，先把上一轮的勾选清空
     ws.send(JSON.stringify({ type: "start_task", goal }));
     startBtn.disabled = true; // 任务跑完(done/error)才重新允许点击，避免中途并发开第二个任务
   }
