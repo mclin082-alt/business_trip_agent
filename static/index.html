@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>商务拜访执行 Agent - Phase 4/5</title>
+<title>商务拜访执行 Agent - Phase 6.5</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -150,9 +150,11 @@
     word-break: break-word;
   }
 
-  /* Goal */
+  /* Goal / 用户回复：同一种视觉语言，都代表"用户说的话" */
   .entry.goal .tag { background: var(--user); color: var(--text); }
   .entry.goal .text { font-weight: 600; }
+  .entry.user_reply .tag { background: var(--user); color: var(--text); }
+  .entry.user_reply .text { font-weight: 600; }
 
   /* Reasoning：高亮展示，这是"决策来自现场推理"的核心证据 */
   .entry.reasoning {
@@ -174,6 +176,15 @@
 
   /* Thinking placeholder */
   .entry.thinking .text { color: var(--dim); font-style: italic; }
+
+  /* 等待用户回复：单独一种样式，明确告诉用户"任务没结束，轮到你说话了" */
+  .entry.awaiting_reply {
+    border-left: 3px solid var(--accent);
+    padding-left: 10px;
+    background: rgba(91, 140, 255, 0.06);
+  }
+  .entry.awaiting_reply .tag { background: rgba(91, 140, 255, 0.18); color: var(--accent); }
+  .entry.awaiting_reply .text { color: var(--dim); }
 
   /* Done / Error */
   .entry.done { border-left: 3px solid var(--ok); padding-left: 10px; }
@@ -210,6 +221,26 @@
     margin-bottom: 12px;
   }
   .approval-card .approval-action b { color: var(--text); font-weight: 600; }
+  .approval-card .approval-note-wrap { margin-bottom: 12px; }
+  .approval-card .approval-note-label {
+    font-size: 11.5px;
+    color: var(--dim);
+    margin-bottom: 4px;
+  }
+  .approval-card .approval-note {
+    width: 100%;
+    background: #0b0d12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    resize: vertical;
+    min-height: 36px;
+    outline: none;
+  }
+  .approval-card .approval-note:focus { border-color: var(--accent); }
   .approval-btns { display: flex; gap: 8px; }
   .approval-btns button {
     flex: 1;
@@ -223,6 +254,7 @@
   .btn-approve { background: var(--ok); color: #06251a; }
   .btn-reject { background: transparent; color: var(--err); border: 1.5px solid var(--err) !important; }
   .approval-card.resolved .approval-btns { display: none; }
+  .approval-card.resolved .approval-note-wrap { display: none; }
   .approval-card.resolved .approval-result {
     font-size: 13px;
     font-weight: 700;
@@ -269,6 +301,7 @@
     outline: none;
   }
   #goal:focus { border-color: var(--accent); }
+  #goal.mode-reply { border-color: var(--accent); }
   #start {
     background: var(--accent);
     border: none;
@@ -278,8 +311,15 @@
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
+    white-space: nowrap;
   }
   #start:disabled { opacity: 0.5; cursor: not-allowed; }
+  .mode-hint {
+    font-size: 12px;
+    color: var(--accent);
+    margin: -4px 0 8px 2px;
+    min-height: 16px;
+  }
 
   @keyframes fadein {
     from { opacity: 0; transform: translateY(-4px); }
@@ -295,7 +335,7 @@
 <body>
   <div class="wrap">
     <h1>商务拜访执行 Agent</h1>
-    <div class="sub">Phase 4/5 · 人工审批卡片 + 执行层/决策层最终报告 —— 该不该申请审批、审批被拒后怎么办，都由模型现场决定；批不批准，是你的决定</div>
+    <div class="sub">Phase 4/5/6.5 · 人工审批卡片 + 执行层/决策层最终报告 + 会话延续 —— 该不该申请审批、审批被拒后怎么办、要不要反问用户，都由模型现场决定；批不批准、怎么回答，是你的决定</div>
     <div class="status">
       <span class="dot" id="dot"></span>
       <span id="status-text">连接中…</span>
@@ -306,6 +346,7 @@
         <div class="log" id="log">
           <div class="placeholder" id="placeholder">在下面输入一个目标，点"开始任务"，观察模型自己规划、遇到问题自己重新决策的过程…</div>
         </div>
+        <div class="mode-hint" id="mode-hint"></div>
         <div class="input-row">
           <input id="goal" type="text"
                  value="下周二安排去上海拜访客户，把事情办妥"
@@ -331,6 +372,7 @@
   const placeholder = document.getElementById("placeholder");
   const goalInput = document.getElementById("goal");
   const startBtn = document.getElementById("start");
+  const modeHint = document.getElementById("mode-hint");
   const checklistItemsEl = document.getElementById("checklist-items");
   const checklistDoneEl = document.getElementById("checklist-done");
   const checklistTotalEl = document.getElementById("checklist-total");
@@ -346,7 +388,35 @@
   };
 
   let thinkingEl = null;
-  let pendingApprovalEl = null; // 当前正等待用户点击的审批卡片，resolved 之后清空
+
+  // Phase 6.5：输入框现在有两种模式——
+  // "idle"：还没开始任务 / 上一个任务已结束，点按钮 = 开一个新任务（start_task）
+  // "reply"：当前任务还在进行、模型在等用户回话（awaiting_reply），点按钮 = 把
+  //          输入框内容作为 user_reply 续进同一个任务，不会新建任务
+  // 处于 "running"（任务正在跑，既不在等审批也不在等回复）时按钮禁用。
+  let inputMode = "idle";
+
+  function setInputMode(mode) {
+    inputMode = mode;
+    if (mode === "idle") {
+      startBtn.disabled = false;
+      startBtn.textContent = "开始任务";
+      goalInput.classList.remove("mode-reply");
+      modeHint.textContent = "";
+    } else if (mode === "reply") {
+      startBtn.disabled = false;
+      startBtn.textContent = "发送回复";
+      goalInput.classList.add("mode-reply");
+      goalInput.value = "";
+      goalInput.focus();
+      modeHint.textContent = "模型在等你回话，任务还没结束——刚才查过的信息和已经订好的部分都还记得。";
+    } else if (mode === "running") {
+      startBtn.disabled = true;
+      startBtn.textContent = "任务进行中…";
+      goalInput.classList.remove("mode-reply");
+      modeHint.textContent = "";
+    }
+  }
 
   function renderChecklist(items, labels) {
     labels = labels || DEFAULT_CHECKLIST_LABELS;
@@ -368,6 +438,7 @@
 
   // 初始渲染一份空的 Checklist，任务开始后后端会推送真实状态覆盖它
   renderChecklist({}, DEFAULT_CHECKLIST_LABELS);
+  setInputMode("idle");
 
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${location.host}/ws`);
@@ -375,7 +446,7 @@
   ws.onopen = () => {
     dot.classList.add("connected");
     statusText.textContent = "已连接";
-    startBtn.disabled = false;
+    if (inputMode !== "running") setInputMode(inputMode);
   };
   ws.onclose = () => {
     dot.classList.remove("connected");
@@ -401,7 +472,9 @@
     return entry;
   }
 
-  // Phase 4：渲染一张审批卡片，点击后发送 approval_response 并把卡片标记为已处理
+  // Phase 4 + 6.5：渲染一张审批卡片。拒绝按钮旁边加了一个可选的文本框，
+  // 用户可以直接写一句反馈（比如"改成更便宜的酒店"）随拒绝一起带给模型，
+  // 不填也完全可以——不填的话模型如果需要更多信息，会转到"等待回复"模式反问。
   function renderApprovalCard(reason, proposedAction) {
     if (placeholder) placeholder.remove();
     const card = document.createElement("div");
@@ -410,6 +483,10 @@
       <div class="approval-title">⏸ 需要人工审批</div>
       <div class="approval-reason">${esc(reason)}</div>
       <div class="approval-action">如果批准，将执行：<b>${esc(proposedAction)}</b></div>
+      <div class="approval-note-wrap">
+        <div class="approval-note-label">可选：如果拒绝，可以顺手写一句你希望怎么调整（不填也可以）</div>
+        <textarea class="approval-note" rows="1" placeholder="例如：改成更便宜、离地铁站近的酒店"></textarea>
+      </div>
       <div class="approval-btns">
         <button class="btn-reject">拒绝</button>
         <button class="btn-approve">批准</button>
@@ -418,20 +495,21 @@
     logEl.appendChild(card);
     logEl.scrollTop = logEl.scrollHeight;
 
+    const noteInput = card.querySelector(".approval-note");
+
     function resolve(approved) {
+      const userNote = approved ? "" : noteInput.value.trim();
       card.classList.add("resolved", approved ? "approved" : "rejected");
       const btns = card.querySelector(".approval-btns");
       const result = document.createElement("div");
       result.className = "approval-result";
-      result.textContent = approved ? "✓ 已批准" : "✕ 已拒绝";
+      result.textContent = approved ? "✓ 已批准" : (userNote ? "✕ 已拒绝（附反馈）" : "✕ 已拒绝");
       btns.insertAdjacentElement("afterend", result);
-      ws.send(JSON.stringify({ type: "approval_response", approved }));
-      pendingApprovalEl = null;
+      ws.send(JSON.stringify({ type: "approval_response", approved, user_note: userNote }));
     }
     card.querySelector(".btn-approve").addEventListener("click", () => resolve(true));
     card.querySelector(".btn-reject").addEventListener("click", () => resolve(false));
 
-    pendingApprovalEl = card;
     return card;
   }
 
@@ -474,6 +552,7 @@
 
     if (data.type === "goal") {
       appendEntry("goal", "目标", `<span class="text">${esc(data.text)}</span>`);
+      setInputMode("running");
 
     } else if (data.type === "thinking") {
       clearThinking();
@@ -506,11 +585,27 @@
     } else if (data.type === "approval_request") {
       clearThinking();
       renderApprovalCard(data.reason, data.proposed_action);
-      // 停在这里等用户点按钮，不主动启用开始任务按钮——任务仍在进行中
+      // 停在这里等用户点按钮，输入框保持禁用——任务仍在进行中，且这一步的
+      // 交互走审批卡片本身，不走下面的输入框
 
     } else if (data.type === "approval_resolved") {
-      // 卡片自己在点击时已经就地更新了状态，这里不需要额外处理，
-      // 只是让后端确认这一步已经收到，方便调试时对照日志
+      // 卡片自己在点击时已经就地更新了状态，这里不需要额外处理
+
+    } else if (data.type === "awaiting_reply") {
+      // Phase 6.5 核心：Checklist 还没满，模型没调用工具，说明它在等用户说话。
+      // 任务并没有结束，只是切换到"等待回复"模式，解锁输入框但不当成新任务。
+      clearThinking();
+      appendEntry(
+        "awaiting_reply",
+        "等待回复",
+        `<span class="text">模型正在等待你的回复，任务尚未结束——请在下方输入框中回复。</span>`
+      );
+      setInputMode("reply");
+
+    } else if (data.type === "user_reply") {
+      // 用户刚才在"等待回复"模式下发送的话，由后端确认后回显，保持日志流完整
+      appendEntry("user_reply", "你", `<span class="text">${esc(data.text)}</span>`);
+      setInputMode("running");
 
     } else if (data.type === "generating_report") {
       clearThinking();
@@ -522,27 +617,36 @@
 
     } else if (data.type === "done") {
       clearThinking();
-      appendEntry("done", "完成", `<span class="text">任务已结束（模型这一轮没有再调用任何工具）。</span>`);
-      startBtn.disabled = false;
+      appendEntry("done", "完成", `<span class="text">任务已结束（Checklist 全部完成，模型确认无需再调用任何工具）。</span>`);
+      setInputMode("idle");
+      goalInput.value = "";
 
     } else if (data.type === "error") {
       clearThinking();
       appendEntry("error", "出错", `<span class="text">${esc(data.text)}</span>`);
-      startBtn.disabled = false;
+      setInputMode("idle");
     }
   };
 
-  function startTask() {
-    const goal = goalInput.value.trim();
-    if (!goal || ws.readyState !== WebSocket.OPEN) return;
-    renderChecklist({}, DEFAULT_CHECKLIST_LABELS); // 新任务开始，先把上一轮的勾选清空
-    ws.send(JSON.stringify({ type: "start_task", goal }));
-    startBtn.disabled = true; // 任务跑完(done/error)才重新允许点击，避免中途并发开第二个任务
+  function handleSubmit() {
+    const value = goalInput.value.trim();
+    if (!value || ws.readyState !== WebSocket.OPEN) return;
+
+    if (inputMode === "reply") {
+      // Phase 6.5：续进当前正在进行的任务，而不是开一个新任务
+      ws.send(JSON.stringify({ type: "user_reply", text: value }));
+      setInputMode("running");
+    } else if (inputMode === "idle") {
+      renderChecklist({}, DEFAULT_CHECKLIST_LABELS); // 新任务开始，先把上一轮的勾选清空
+      ws.send(JSON.stringify({ type: "start_task", goal: value }));
+      setInputMode("running");
+    }
+    // inputMode === "running" 时按钮本就是禁用状态，理论上不会走到这里
   }
 
-  startBtn.addEventListener("click", startTask);
+  startBtn.addEventListener("click", handleSubmit);
   goalInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") startTask();
+    if (e.key === "Enter") handleSubmit();
   });
 </script>
 </body>
