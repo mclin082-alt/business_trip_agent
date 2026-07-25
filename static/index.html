@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>商务拜访执行 Agent - Phase 3</title>
+<title>商务拜访执行 Agent - Phase 4/5</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -183,6 +183,80 @@
 
   .placeholder { color: var(--dim); font-size: 13px; padding: 12px; }
 
+  /* 人工审批卡片：需要明显区别于普通日志条目 */
+  .approval-card {
+    background: rgba(224, 168, 60, 0.08);
+    border: 1.5px solid var(--warn);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 2px;
+    animation: fadein 0.25s ease;
+  }
+  .approval-card .approval-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--warn);
+    letter-spacing: 0.02em;
+    margin-bottom: 8px;
+  }
+  .approval-card .approval-reason {
+    font-size: 14px;
+    line-height: 1.55;
+    margin-bottom: 8px;
+  }
+  .approval-card .approval-action {
+    font-size: 13px;
+    color: var(--dim);
+    margin-bottom: 12px;
+  }
+  .approval-card .approval-action b { color: var(--text); font-weight: 600; }
+  .approval-btns { display: flex; gap: 8px; }
+  .approval-btns button {
+    flex: 1;
+    padding: 9px 0;
+    border-radius: 8px;
+    border: none;
+    font-size: 13.5px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-approve { background: var(--ok); color: #06251a; }
+  .btn-reject { background: transparent; color: var(--err); border: 1.5px solid var(--err) !important; }
+  .approval-card.resolved .approval-btns { display: none; }
+  .approval-card.resolved .approval-result {
+    font-size: 13px;
+    font-weight: 700;
+    padding: 6px 10px;
+    border-radius: 6px;
+    display: inline-block;
+  }
+  .approval-card.resolved.approved .approval-result { background: rgba(53, 201, 143, 0.18); color: var(--ok); }
+  .approval-card.resolved.rejected .approval-result { background: rgba(224, 92, 92, 0.18); color: var(--err); }
+
+  /* 最终报告：执行层 / 决策层 二分展示 */
+  .report-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 4px 0;
+    margin-bottom: 2px;
+    animation: fadein 0.25s ease;
+  }
+  .report-section { padding: 14px 16px; }
+  .report-section + .report-section { border-top: 1px solid var(--border); }
+  .report-section-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    margin-bottom: 10px;
+  }
+  .report-section.execution .report-section-title { color: var(--ok); }
+  .report-section.decision .report-section-title { color: var(--warn); }
+  .report-section ul { margin: 0; padding-left: 18px; }
+  .report-section li { font-size: 13.5px; line-height: 1.6; margin-bottom: 6px; }
+  .report-section li:last-child { margin-bottom: 0; }
+  .report-empty { font-size: 13px; color: var(--dim); font-style: italic; }
+
   .input-row { display: flex; gap: 8px; }
   #goal {
     flex: 1;
@@ -221,7 +295,7 @@
 <body>
   <div class="wrap">
     <h1>商务拜访执行 Agent</h1>
-    <div class="sub">Phase 3 · 全部工具补齐 + Checklist 可视化 —— 工具该怎么用、失败了怎么办，全部由模型现场决定；Checklist 只核对客观结果，不参与决策</div>
+    <div class="sub">Phase 4/5 · 人工审批卡片 + 执行层/决策层最终报告 —— 该不该申请审批、审批被拒后怎么办，都由模型现场决定；批不批准，是你的决定</div>
     <div class="status">
       <span class="dot" id="dot"></span>
       <span id="status-text">连接中…</span>
@@ -272,6 +346,7 @@
   };
 
   let thinkingEl = null;
+  let pendingApprovalEl = null; // 当前正等待用户点击的审批卡片，resolved 之后清空
 
   function renderChecklist(items, labels) {
     labels = labels || DEFAULT_CHECKLIST_LABELS;
@@ -326,6 +401,68 @@
     return entry;
   }
 
+  // Phase 4：渲染一张审批卡片，点击后发送 approval_response 并把卡片标记为已处理
+  function renderApprovalCard(reason, proposedAction) {
+    if (placeholder) placeholder.remove();
+    const card = document.createElement("div");
+    card.className = "approval-card";
+    card.innerHTML = `
+      <div class="approval-title">⏸ 需要人工审批</div>
+      <div class="approval-reason">${esc(reason)}</div>
+      <div class="approval-action">如果批准，将执行：<b>${esc(proposedAction)}</b></div>
+      <div class="approval-btns">
+        <button class="btn-reject">拒绝</button>
+        <button class="btn-approve">批准</button>
+      </div>
+    `;
+    logEl.appendChild(card);
+    logEl.scrollTop = logEl.scrollHeight;
+
+    function resolve(approved) {
+      card.classList.add("resolved", approved ? "approved" : "rejected");
+      const btns = card.querySelector(".approval-btns");
+      const result = document.createElement("div");
+      result.className = "approval-result";
+      result.textContent = approved ? "✓ 已批准" : "✕ 已拒绝";
+      btns.insertAdjacentElement("afterend", result);
+      ws.send(JSON.stringify({ type: "approval_response", approved }));
+      pendingApprovalEl = null;
+    }
+    card.querySelector(".btn-approve").addEventListener("click", () => resolve(true));
+    card.querySelector(".btn-reject").addEventListener("click", () => resolve(false));
+
+    pendingApprovalEl = card;
+    return card;
+  }
+
+  // Phase 5：渲染执行层/决策层最终报告
+  function renderFinalReport(executionLayer, decisionLayer) {
+    if (placeholder) placeholder.remove();
+    const card = document.createElement("div");
+    card.className = "report-card";
+
+    const execItems = (executionLayer && executionLayer.length)
+      ? `<ul>${executionLayer.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`
+      : `<div class="report-empty">（无内容）</div>`;
+    const decisionItems = (decisionLayer && decisionLayer.length)
+      ? `<ul>${decisionLayer.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`
+      : `<div class="report-empty">（无内容）</div>`;
+
+    card.innerHTML = `
+      <div class="report-section execution">
+        <div class="report-section-title">✅ 执行层（客观验证通过）</div>
+        ${execItems}
+      </div>
+      <div class="report-section decision">
+        <div class="report-section-title">⚠️ 决策层（建议人工复核）</div>
+        ${decisionItems}
+      </div>
+    `;
+    logEl.appendChild(card);
+    logEl.scrollTop = logEl.scrollHeight;
+    return card;
+  }
+
   function esc(s) {
     const d = document.createElement("div");
     d.textContent = s;
@@ -365,6 +502,23 @@
 
     } else if (data.type === "checklist") {
       renderChecklist(data.items, data.labels);
+
+    } else if (data.type === "approval_request") {
+      clearThinking();
+      renderApprovalCard(data.reason, data.proposed_action);
+      // 停在这里等用户点按钮，不主动启用开始任务按钮——任务仍在进行中
+
+    } else if (data.type === "approval_resolved") {
+      // 卡片自己在点击时已经就地更新了状态，这里不需要额外处理，
+      // 只是让后端确认这一步已经收到，方便调试时对照日志
+
+    } else if (data.type === "generating_report") {
+      clearThinking();
+      thinkingEl = appendEntry("thinking", "模型", `<span class="text">正在生成最终报告…</span>`);
+
+    } else if (data.type === "final_report") {
+      clearThinking();
+      renderFinalReport(data.execution_layer, data.decision_layer);
 
     } else if (data.type === "done") {
       clearThinking();

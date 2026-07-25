@@ -1,27 +1,32 @@
 """
-Phase 3: 补全全部工具 + Checklist 可视化
+Phase 4 + 5: 人工审批卡片 + 执行层/决策层最终报告
 
-在 Phase 2 的基础上，这一步做了两件事：
+在 Phase 3 的基础上，这一步做了两件事：
 
-1. 把方案书里完整的工具集补齐（CRM 查询、双方日历查询、差旅政策查询、酒店搜索、
-   酒店/机票预订、日历同步、发确认邮件），一共 10 个"假工具"——都是普通 Python
-   函数，返回写死的假数据，形式和 Phase 2 的 3 个工具完全一样。
-2. 网页侧边栏加了一个 5 项 Checklist（对应方案书 4 节的 Verifier），随着任务推进
-   逐项打勾，勾选状态通过 WebSocket 实时推送。
+1. **人工审批（Phase 4）**：新增一个特殊工具 `request_human_approval`。模型判断
+   遇到"预算超出政策上限"或"即将向客户发送最终确认邮件"这两类场景时，必须先
+   调用这个工具，网页上会弹出一张卡片展示它给出的理由和打算执行的动作，程序会
+   真正暂停，等用户点"批准/拒绝"之后，这个结果才作为下一个 Observation 喂回模型
+   继续循环——不是命令行里的 `input()`，也不是自动跳过。
+   这也是为什么 Phase 3 里 `get_travel_policy` 那句"当前 demo 暂未接入审批流程"
+   现在被拿掉了：审批流程已经是真的了。
 
-**关于 Checklist 怎么判定"打没打勾"，这里有一个重要的设计原则需要讲清楚**：
-打勾这件事本身是**代码做的**，不是模型决定的——但这不违反"决策必须由模型现场
-推理"这条红线。原因是：Checklist 检查的是"客观事实有没有发生"（比如"预订工具
-是不是返回了 success"），而不是"接下来该怎么办"。前者是 Verifier（验证器）的
-职责，后者才是 Agent 的决策职责，这两者在方案书第四节、第五节里是明确分开的两
-层。所以下面 `_update_checklist` 函数里没有任何一行是在替模型判断"该订哪个酒店/
-该不该重试"，它只是在核对"航班预订成功了吗、酒店预订成功了吗"这些客观结果。
+2. **执行层/决策层最终报告（Phase 5）**：五项 Checklist 全部完成、模型这一轮不再
+   调用任何工具时，不是直接显示"Done"，而是再调用一次模型，让它基于本次任务
+   真实发生的工具调用历史和审批记录，生成一份区分两层的总结：✅ 执行层（订单号、
+   确认号这些有客观依据、可验证的事实）和 ⚠️ 决策层（选择的取舍、被批准的例外，
+   需要人复核的地方）。这次调用不带 tools，纯文本/JSON 生成。
+
+**审批这一步能不能也算是代码在"替模型做决策"？** 不算。代码只负责在模型主动
+调用 `request_human_approval` 时暂停、等待、把用户的选择原样喂回去——"要不要在
+这个时间点申请审批"以及"申请被拒绝之后该怎么办"仍然完全是模型自己在推理文字
+里决定的，代码没有写死任何"超预算就自动走审批分支"这种 if。
 
 两个刻意设计的失败点仍然保留：
 - 航班：09:00 满员（Phase 2 就有）
 - 酒店：客户公司在陆家嘴核心区，附近酒店都超预算——但 mock 数据里给了一个稍远
-  但在预算内的选项，模型应该能自己发现并选择它（这一步不需要人工审批介入，
-  人工审批是 Phase 4 才加的）。
+  但在预算内的选项。现在遇到超预算，模型应该先发起审批，而不是像 Phase 3 那样
+  自己在合规范围内硬扛。
 """
 
 import asyncio
@@ -92,8 +97,8 @@ MOCK_DATA = {
         "hotel_budget_per_night": 800,
         "note": (
             "机票经济舱据实报销，单次不超过 1500 元；酒店每晚不超过 800 元。"
-            "超出部分需要经理审批（当前 demo 暂未接入在线审批流程，请在合规范围内"
-            "自行给出最优方案，例如更换预算内的酒店）。"
+            "超出部分需要经理审批——遇到超预算的情况，请调用 request_human_approval "
+            "工具说明理由并等待批准，不要自己直接下单。"
         ),
     },
     "search_flight": {
@@ -314,7 +319,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "book_hotel",
-            "description": "预订某个具体酒店。只应该在已经确认该酒店符合预算（或明确判断可以接受超预算方案）之后才调用。",
+            "description": "预订某个具体酒店。如果该酒店价格在预算内可以直接调用；如果超出差旅政策的每晚预算上限，必须先调用 request_human_approval 获得批准之后才能调用这个工具，不能自己直接下单。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -345,7 +350,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "send_confirmation_email",
-            "description": "向客户发送本次拜访的确认邮件/通知。应该在行程全部确认（航班、酒店、会面时间）之后，作为最后一步调用。",
+            "description": "向客户发送本次拜访的确认邮件/通知。这是面向客户的外部动作，应该在行程全部确认（航班、酒店、会面时间）之后，并且已经通过 request_human_approval 获得最终发送确认之后，作为最后一步调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -353,6 +358,27 @@ TOOLS = [
                     "summary": {"type": "string", "description": "本次拜访行程的简要总结，会写进邮件正文"},
                 },
                 "required": ["to", "summary"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_human_approval",
+            "description": (
+                "在需要人工审批的场景下调用此工具，暂停当前流程，向用户展示理由和你打算"
+                "执行的动作，等待用户点击'批准'或'拒绝'后再继续。以下两种情况必须调用它："
+                "① 打算预订的酒店价格超出差旅政策的每晚预算上限；"
+                "② 正式向客户发送确认邮件之前的最终确认（无论前面是否超预算都需要走这一步，"
+                "因为这是面向客户的外部、不可逆动作）。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "为什么需要人工审批，用自然语言说明当前情况"},
+                    "proposed_action": {"type": "string", "description": "如果获得批准，你打算执行的具体动作"},
+                },
+                "required": ["reason", "proposed_action"],
             },
         },
     },
@@ -370,16 +396,47 @@ SYSTEM_PROMPT = """你是一个商务拜访执行 Agent，负责帮用户把一�
    有别的代码会替你处理失败或者超预算的情况。
 2. 在每次调用工具之前，务必先用一小段文字说明你的推理过程。这段文字会原样展示
    给用户看，请务必用自然语言写清楚，不要省略。
-3. 如果某个查询结果显示失败或者不满足约束（比如航班满员、酒店超预算），不要放弃，
-   自己重新想办法（比如换一个时间/换一个酒店选项），直到任务真正完成，或者你判断
-   确实无法完成为止。当前 demo 还没有接入人工审批流程，如果遇到超预算的情况，请在
-   给定的备选项里自己找到一个合规的方案。
-4. 建议的大致顺序是：先了解客户信息和双方日程、查政策，再搜索并确认航班和酒店，
+3. 如果某个查询结果显示失败或者不满足约束（比如航班满员），不要放弃，自己重新
+   想办法（比如换一个时间），直到任务真正完成，或者你判断确实无法完成为止。
+4. 以下两种情况，你必须先调用 `request_human_approval` 工具，说明理由和你打算
+   执行的动作，等待用户批准之后才能继续对应的下一步，不能自己直接执行：
+   a）打算预订的酒店价格超出差旅政策规定的每晚预算上限；
+   b）正式调用 send_confirmation_email 向客户发送确认邮件之前，都要先走一次
+      最终确认（这是面向客户的外部动作）。
+   如果用户拒绝了某次审批请求，你需要重新想办法（比如换一个方案）而不是无视
+   拒绝结果继续按原计划执行。
+5. 建议的大致顺序是：先了解客户信息和双方日程、查政策，再搜索并确认航班和酒店，
    最后把行程同步到日历、发确认邮件给客户——但如果你判断有更合理的顺序，可以自行
    调整，这不是硬性规定。
-5. 当你确认任务已经全部完成（航班、酒店都已预订，日历已同步，确认邮件已发送），
+6. 当你确认任务已经全部完成（航班、酒店都已预订，日历已同步，确认邮件已发送），
    请输出一段总结文字说明做了什么、结果如何，并且这一轮**不要再调用任何工具**——
    不调用工具就代表你认为任务结束了，循环会就此停止。
+"""
+
+FINAL_REPORT_PROMPT = """你是同一个商务拜访执行 Agent，本次任务的所有动作已经执行完毕，现在需要你输出
+一份区分两层的总结报告，帮助用户快速判断"哪些是百分百确定做对的，哪些需要人复核"。
+
+请**只输出 JSON**，不要有任何 JSON 之外的文字、不要用 Markdown 代码块包裹，格式如下：
+{{"execution_layer": ["...", "..."], "decision_layer": ["...", "..."]}}
+
+- execution_layer（执行层）：只写有客观依据、可以验证的事实，例如订单号/确认号/event_id/
+  message_id 确实存在、Checklist 是否全部完成。每条一句话，尽量带上具体编号。
+- decision_layer（决策层）：写需要人工复核的权衡取舍，例如为什么选了这个方案而不是别的、
+  审批中批准的超预算金额和理由、可能存在的风险（比如可退改灵活度、临时改期怎么办）。
+  如果本次任务完全没有需要复核的点，就如实写一条说明"本次未触发需要复核的例外情况"。
+
+务必完全基于下面这份真实执行记录来写，不要编造没有发生过的信息。
+
+目标：{goal}
+
+Checklist 完成状态：
+{checklist}
+
+工具调用与返回历史（按发生顺序）：
+{tool_history}
+
+人工审批记录：
+{approval_records}
 """
 
 
@@ -398,7 +455,7 @@ def _call_with_tools(messages: list[dict]):
     return response.choices[0].message
 
 
-MAX_TURNS = 14  # 工具变多了，适当放宽轮次上限，防止模型陷入死循环时强制停止
+MAX_TURNS = 16  # 比 Phase 3 稍宽松一点，因为审批交互会多占用一两轮
 
 
 # ------------------------------------------------------------------
@@ -436,7 +493,75 @@ def _update_checklist(checklist: dict, customer_calendar_queried: bool, name: st
         checklist["meeting"] = True
 
 
-async def run_agent_loop(websocket: WebSocket, goal: str):
+def _format_tool_history(action_log: list[dict]) -> str:
+    if not action_log:
+        return "（无）"
+    lines = []
+    for item in action_log:
+        lines.append(
+            f"- 调用 {item['name']}，参数：{json.dumps(item['args'], ensure_ascii=False)}，"
+            f"返回：{json.dumps(item['result'], ensure_ascii=False)}"
+        )
+    return "\n".join(lines)
+
+
+def _format_approval_records(approval_records: list[dict]) -> str:
+    if not approval_records:
+        return "（本次任务未触发任何人工审批）"
+    lines = []
+    for r in approval_records:
+        outcome = "已批准" if r["approved"] else "被拒绝"
+        lines.append(f"- 理由：{r['reason']}；拟执行动作：{r['proposed_action']}；结果：{outcome}")
+    return "\n".join(lines)
+
+
+async def generate_final_report(goal: str, checklist: dict, action_log: list[dict], approval_records: list[dict]) -> dict:
+    """
+    Phase 5：五项 Checklist 全部完成后，再单独调用一次模型（不带 tools），让它基于
+    这次任务真实发生的工具调用历史和审批记录，生成执行层/决策层二分报告。
+
+    这次调用刻意不复用主循环的 messages 历史，而是重新组织一份干净的"事实清单"
+    喂给模型——这样即使主循环的上下文已经很长，报告依然会紧扣真实发生的事情，
+    而不是被前面大段的推理文字带偏。
+    """
+    checklist_text = "\n".join(
+        f"- {CHECKLIST_LABELS[key]}：{'已完成' if done else '未完成'}"
+        for key, done in checklist.items()
+    )
+    prompt = FINAL_REPORT_PROMPT.format(
+        goal=goal,
+        checklist=checklist_text,
+        tool_history=_format_tool_history(action_log),
+        approval_records=_format_approval_records(approval_records),
+    )
+
+    response = await asyncio.to_thread(
+        client.chat.completions.create,
+        model=QWEN_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw_text = response.choices[0].message.content or ""
+
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    try:
+        data = json.loads(cleaned)
+        execution_layer = data.get("execution_layer") or []
+        decision_layer = data.get("decision_layer") or []
+    except json.JSONDecodeError:
+        # 模型没有按要求只输出 JSON，兜底：至少别把内容丢了，原样塞进决策层展示
+        execution_layer = []
+        decision_layer = [raw_text.strip()] if raw_text.strip() else ["⚠️ 报告生成格式异常，请查看后台日志。"]
+
+    return {"execution_layer": execution_layer, "decision_layer": decision_layer}
+
+
+async def run_agent_loop(websocket: WebSocket, goal: str, approval_queue: "asyncio.Queue[bool]"):
     """
     核心循环：调用模型 → 它说要用哪个工具 → 执行工具 → 把结果丢回去 → 重复，
     直到它不再调用工具（代表它认为完成了）。
@@ -444,6 +569,14 @@ async def run_agent_loop(websocket: WebSocket, goal: str):
     这个 for 循环里依然没有任何 if "航班满员" / "酒店超预算" then ... 这样的业务
     分支，所有"失败之后怎么办"都是模型自己在推理文字里现场决定的，代码只负责
     机械地执行它选的工具，以及在旁边核对客观结果、更新 Checklist。
+
+    Phase 4 新增：如果模型调用的是 `request_human_approval`，代码不会立即返回
+    结果，而是把请求推给前端、真正暂停在 `await approval_queue.get()` 上，直到
+    用户在网页上点了"批准/拒绝"，这个选择才会作为下一个 Observation 喂回模型。
+
+    Phase 5 新增：`action_log` 和 `approval_records` 会记录本次任务真实发生的
+    每一次工具调用和每一次审批，任务结束时用来生成执行层/决策层报告，保证报告
+    里的每一句话都能对应到一条真实记录，而不是模型凭空总结。
     """
     global _booked_flights, _booked_hotels
     _booked_flights = []
@@ -464,6 +597,8 @@ async def run_agent_loop(websocket: WebSocket, goal: str):
 
     checklist = _new_checklist_state()
     customer_calendar_queried = False
+    action_log: list[dict] = []
+    approval_records: list[dict] = []
     await send(websocket, "checklist", items=checklist, labels=CHECKLIST_LABELS)
 
     for turn in range(MAX_TURNS):
@@ -493,6 +628,13 @@ async def run_agent_loop(websocket: WebSocket, goal: str):
 
         if not message.tool_calls:
             # 模型这一轮没有选任何工具，代表它认为任务已经完成
+            if all(checklist.values()):
+                await send(websocket, "generating_report")
+                try:
+                    report = await generate_final_report(goal, checklist, action_log, approval_records)
+                    await send(websocket, "final_report", **report)
+                except Exception as exc:  # noqa: BLE001
+                    await send(websocket, "error", text=f"⚠️ 生成最终报告失败：{exc}")
             await send(websocket, "done")
             return
 
@@ -505,16 +647,37 @@ async def run_agent_loop(websocket: WebSocket, goal: str):
 
             await send(websocket, "tool_call", name=name, arguments=args)
 
-            func = TOOL_FUNCTIONS.get(name)
-            if func is None:
-                result = {"status": "error", "message": f"未知工具：{name}"}
+            if name == "request_human_approval":
+                # Phase 4 的核心：这里真正暂停，等用户在网页上点按钮。
+                # 代码不判断"该不该批准"，那是用户的决定；代码也不判断"要不要发起
+                # 审批"，那是模型刚才自己决定的——代码只是搭一座桥，把两边接起来。
+                reason = args.get("reason", "")
+                proposed_action = args.get("proposed_action", "")
+                await send(websocket, "approval_request", reason=reason, proposed_action=proposed_action)
+                approved = await approval_queue.get()
+                result = (
+                    {"status": "approved", "message": f"用户已批准：{proposed_action}"}
+                    if approved
+                    else {"status": "rejected", "message": "用户拒绝了该请求，请重新考虑其他合规方案，不要无视拒绝结果继续执行原计划。"}
+                )
+                approval_records.append({
+                    "reason": reason,
+                    "proposed_action": proposed_action,
+                    "approved": approved,
+                })
+                await send(websocket, "approval_resolved", approved=approved)
             else:
-                try:
-                    result = func(**args)
-                except Exception as exc:  # noqa: BLE001
-                    result = {"status": "error", "message": str(exc)}
+                func = TOOL_FUNCTIONS.get(name)
+                if func is None:
+                    result = {"status": "error", "message": f"未知工具：{name}"}
+                else:
+                    try:
+                        result = func(**args)
+                    except Exception as exc:  # noqa: BLE001
+                        result = {"status": "error", "message": str(exc)}
 
             await send(websocket, "tool_result", name=name, result=result)
+            action_log.append({"name": name, "args": args, "result": result})
 
             if name == "get_customer_calendar" and result.get("status") != "error":
                 customer_calendar_queried = True
@@ -541,11 +704,22 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     请求路径：
     网页输入一个目标、点"开始任务" → 前端发 {"type": "start_task", "goal": "..."}
-    → 这个函数调用 run_agent_loop，在循环里通过同一个 WebSocket 把每一步
-      （goal / thinking / reasoning / tool_call / tool_result / checklist / done / error）
-      推给网页，网页收到后实时渲染成日志流 + 更新侧边栏 Checklist。
+    → 这个函数把 run_agent_loop 作为一个后台 task 启动，自己继续留在 while 循环里
+      收消息，通过同一个 WebSocket 把每一步（goal / thinking / reasoning /
+      tool_call / tool_result / checklist / approval_request / final_report /
+      done / error）推给网页，网页收到后实时渲染成日志流 + 更新侧边栏 Checklist。
+
+    Phase 4 之前，这里是"收到 start_task 就 await run_agent_loop"，整个连接会
+    被这一次任务阻塞住，没办法在任务跑到一半时再收别的消息。但审批卡片需要"任务
+    还在跑、同时又能收到用户点击结果"这种并发能力，所以这里改成：
+    - run_agent_loop 变成 asyncio.create_task 起的后台任务；
+    - 外层 while 循环继续 receive_text()，收到 approval_response 就塞进
+      approval_queue，run_agent_loop 里挂起等待的 `await approval_queue.get()`
+      就会被唤醒，循环得以继续。
     """
     await websocket.accept()
+    approval_queue: asyncio.Queue = asyncio.Queue()
+    current_task: asyncio.Task | None = None
     try:
         while True:
             raw = await websocket.receive_text()
@@ -554,16 +728,28 @@ async def websocket_endpoint(websocket: WebSocket):
             except json.JSONDecodeError:
                 continue
 
-            if payload.get("type") != "start_task":
-                continue
+            msg_type = payload.get("type")
 
-            goal = (payload.get("goal") or "").strip()
-            if not goal:
-                continue
+            if msg_type == "start_task":
+                if current_task is not None and not current_task.done():
+                    # 上一个任务还没跑完（比如正卡在等审批），忽略新的开始请求，
+                    # 前端按钮此时本来也是禁用状态，这里只是双重保险。
+                    continue
+                goal = (payload.get("goal") or "").strip()
+                if not goal:
+                    continue
+                # 清空上一轮可能残留的审批响应，避免串到新任务里
+                while not approval_queue.empty():
+                    approval_queue.get_nowait()
+                current_task = asyncio.create_task(run_agent_loop(websocket, goal, approval_queue))
 
-            await run_agent_loop(websocket, goal)
+            elif msg_type == "approval_response":
+                await approval_queue.put(bool(payload.get("approved")))
+
     except WebSocketDisconnect:
         print("客户端断开连接")
+        if current_task is not None and not current_task.done():
+            current_task.cancel()
 
 
 if __name__ == "__main__":
