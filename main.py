@@ -1,50 +1,32 @@
 """
-Phase 4 + 5 + 6.5
+商务拜访执行 Agent（Business Trip Execution Agent）
 
-在 Phase 3 的基础上：
+一句话目标 → 模型自主规划 → 调用工具执行 → 读取原始返回结果现场推理下一步，
+直到对照 Checklist（Verifier）确认任务真正完成。
 
-1. **人工审批（Phase 4）**：新增一个特殊工具 `request_human_approval`。模型判断
-   遇到"预算超出政策上限"或"即将向客户发送最终确认邮件"这两类场景时，必须先
-   调用这个工具，网页上会弹出一张卡片展示它给出的理由和打算执行的动作，程序会
-   真正暂停，等用户点"批准/拒绝"之后，这个结果才作为下一个 Observation 喂回模型
-   继续循环——不是命令行里的 `input()`，也不是自动跳过。
+核心设计原则：
+- **失败之后怎么办，永远由模型现场推理决定，代码里没有任何
+  `if 航班满 then ...` 这种业务分支。** 工具返回的原始结果会原样喂给模型，
+  代码只负责执行模型选择的下一步动作、以及核对客观结果（Checklist 是否达成）。
+- **人工审批（request_human_approval）**：模型判断需要审批时，程序会真正
+  暂停，把理由和拟执行动作推给前端展示，等用户点击"批准/拒绝"后，这个结果
+  才作为下一个 Observation 喂回模型继续循环。
+- **最终报告**：五项 Checklist 全部完成后，再单独调用一次模型，让它基于本次
+  任务真实发生的工具调用历史和审批记录，生成"✅ 执行层（有客观依据，如订单号）
+  / ⚠️ 决策层（需要人复核的取舍）"二分报告，而不是简单显示"Done"。
+- **会话延续**：模型"这一轮没有调用工具"不代表任务结束——它也可能是在用
+  文字向用户提问、等待回复（例如审批被拒绝后需要新的方案信息）。只有同时满足
+  "没调用工具" + "Checklist 全部完成"才判定任务真正结束。否则会挂起等待用户
+  回复，并把回复追加进同一份对话历史继续循环，不会新建任务、不会丢失上下文。
 
-2. **执行层/决策层最终报告（Phase 5）**：五项 Checklist 全部完成、模型这一轮不再
-   调用任何工具时，不是直接显示"Done"，而是再调用一次模型，让它基于本次任务
-   真实发生的工具调用历史和审批记录，生成一份区分两层的总结：✅ 执行层（订单号、
-   确认号这些有客观依据、可验证的事实）和 ⚠️ 决策层（选择的取舍、被批准的例外，
-   需要人复核的地方）。
-
-3. **会话延续 + 审批拒绝可选反馈（Phase 6.5，见项目内 Phase6.5 设计记录文档）**：
-
-   之前的版本有一个架构漏洞——"模型这一轮没有调用工具"被无条件当成"任务已经
-   完成"，于是不管 Checklist 有没有全部打勾，都会直接 `done` 并销毁本次任务的
-   `messages`。但实际上"没调用工具"至少对应两种完全不同的情况：
-     a) 任务真的做完了（Checklist 5/5）
-     b) 模型缺信息/缺决策依据，用文字反问用户，在等用户回话（Checklist 未满）
-   旧代码只认 (a)，导致 (b) 发生时（最典型的触发点是审批被拒绝后模型反问该怎么
-   改）程序直接判定任务结束、上下文被销毁，用户的下一句回复只能走 `start_task`
-   开一个全新的、上下文为空的任务——表现出来就是模型"失忆"。
-
-   修复方式：**不再单独用"有没有调用工具"判断任务是否结束，而是叠加 Checklist
-   完成度**。没调用工具但 Checklist 未满时，不 `return`，而是挂起在一个新的
-   `reply_queue.get()` 上等用户在同一个任务里继续说话，收到之后把这句话追加进
-   同一份 `messages`，循环继续——这和 Phase 4 里等待审批结果的 `approval_queue`
-   是同一种机制，只是这次等的是一段文字而不是布尔值。
-
-   这条修复完全遵守"下一步怎么办必须是模型现场推理决定"的红线：代码没有替模型
-   判断"该怎么回答用户""该怎么改方案"，代码只是在管理会话状态——什么时候算真
-   结束、什么时候该把新消息续进同一个上下文——这是工程管道层面的事，不是业务
-   判断。
-
-   同时顺带做了一个体验优化（非必须）：审批卡片"拒绝"按钮旁边加了一个可选的
-   文本框，用户可以直接写一句反馈（比如"改成更便宜的酒店"），减少一轮"模型反问
-   →用户在等待回复里再答一次"的往返；不填也完全可以，走普通的等待回复流程。
+以上四点全部通过同一种机制实现：代码只管理"什么时候该暂停、暂停之后从哪里
+继续"这类会话状态，从不替模型做业务判断。
 """
 
 import asyncio
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -55,14 +37,14 @@ from openai import OpenAI
 
 load_dotenv()
 
-app = FastAPI(title="商务拜访执行 Agent - Phase 6.5")
+app = FastAPI(title="商务拜访执行 Agent")
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ------------------------------------------------------------------
-# Qwen API 配置（和之前一样，走 OpenAI 兼容模式）
+# Qwen API 配置（走 OpenAI 兼容模式）
 # ------------------------------------------------------------------
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY")
 QWEN_BASE_URL = os.environ.get(
@@ -83,10 +65,11 @@ async def index():
 
 
 # ------------------------------------------------------------------
-# ============ 假工具的"假数据" ============
+# ============ Mock 数据 ============
 #
-# 这里是唯一允许你为了测试而改动的地方：改这里面的值，不改下面任何函数逻辑，
-# 重新运行程序，观察模型的推理和下一步决策是不是合理地跟着变了。
+# 这是唯一为了测试而改动的地方：改这里面的值、不改下面任何函数逻辑，重新运行，
+# 观察模型的推理和下一步决策是否合理地随之改变——这是验证"决策来自现场推理，
+# 而不是代码里预埋的分支"的最直接方式。
 # ------------------------------------------------------------------
 MOCK_DATA = {
     "get_customer_info": {
@@ -115,25 +98,39 @@ MOCK_DATA = {
         ),
     },
     "search_flight": {
-        # 故意设计的失败点 1：09:00 满员
-        "status": "failed",
-        "reason": "09:00 上海航班已满员",
-        "available_alternatives": ["07:30", "11:30", "14:00"],
+        "flights": [
+            {"flight_id": "MU5101", "departure_time": "07:30", "arrival_time": "09:30",
+             "price": 1380, "search_status": "available", "booking_status": "sold_out"},
+            {"flight_id": "HO1125", "departure_time": "08:30", "arrival_time": "10:30",
+             "price": 1280, "search_status": "available", "booking_status": "available"},
+            {"flight_id": "CA1835", "departure_time": "09:00", "arrival_time": "11:00",
+             "price": 980, "search_status": "available", "booking_status": "available"},
+        ],
     },
     "search_hotel": {
-        # 故意设计的失败点 2：陆家嘴附近酒店都超预算，但有一个稍远的选项在预算内
-        "status": "over_budget",
+        # 刻意设计的失败点 2：陆家嘴附近酒店都超预算，但有一个稍远的选项在预算内
+        "status": "success",
         "policy_limit": 800,
-        "reason": "客户公司位于陆家嘴核心区，周边酒店均价偏高，近距离选项均超出差旅政策预算上限",
+        "summary": "客户公司位于陆家嘴核心区，近距离酒店均超出差旅政策预算上限，但存在预算内的稍远选项",
         "options": [
-            {"hotel_name": "陆家嘴中心大酒店", "distance_to_customer_km": 0.3, "price_per_night": 950},
-            {"hotel_name": "浦东国际会展酒店", "distance_to_customer_km": 0.5, "price_per_night": 920},
-            {"hotel_name": "银城中路商务酒店", "distance_to_customer_km": 1.8, "price_per_night": 780},
+            {"hotel_id": "HTL-A", "hotel_name": "陆家嘴中心大酒店", "distance_to_customer_km": 0.3,
+             "price_per_night": 950, "within_policy": False},
+            {"hotel_id": "HTL-B", "hotel_name": "浦东国际会展酒店", "distance_to_customer_km": 0.5,
+             "price_per_night": 920, "within_policy": False},
+            {"hotel_id": "HTL-C", "hotel_name": "银城中路商务酒店", "distance_to_customer_km": 1.8,
+             "price_per_night": 780, "within_policy": True},
         ],
     },
 }
 
 
+# ------------------------------------------------------------------
+# ============ 工具函数 ============
+#
+# 无状态的查询类工具直接定义为模块级函数即可；"预订"类工具需要记住本次任务
+# 已经订过什么（用来生成递增的订单号），这部分状态不能挂在模块全局变量上——
+# 否则两个并发任务会互相污染彼此的预订记录。见下方 _make_booking_tools()。
+# ------------------------------------------------------------------
 def tool_get_customer_info(company: str = "") -> dict:
     result = dict(MOCK_DATA["get_customer_info"])
     result["queried_company"] = company
@@ -156,46 +153,22 @@ def tool_get_travel_policy() -> dict:
     return dict(MOCK_DATA["get_travel_policy"])
 
 
-def tool_search_flight(date: str = "", preferred_time: str = "") -> dict:
-    result = dict(MOCK_DATA["search_flight"])
-    result["queried_date"] = date
-    result["queried_time"] = preferred_time
-    return result
+def tool_search_flight(date: str = "", destination: str = "") -> dict:
+    public_fields = ["flight_id", "departure_time", "arrival_time", "price", "search_status"]
+    flights = MOCK_DATA["search_flight"]["flights"]
+    return {
+        "status": "success",
+        "queried_date": date,
+        "destination": destination,
+        "flights": [{k: f[k] for k in public_fields} for f in flights],
+    }
 
 
 def tool_search_hotel(date: str = "", near: str = "") -> dict:
-    result = dict(MOCK_DATA["search_hotel"])
+    result = deepcopy(MOCK_DATA["search_hotel"])  # options 是嵌套列表，浅拷贝不够安全
     result["queried_date"] = date
     result["queried_near"] = near
     return result
-
-
-# 用模块级列表模拟"已预订记录"，每次开始新任务时会清空（见 run_agent_loop）
-_booked_flights: list[str] = []
-_booked_hotels: list[str] = []
-
-
-def tool_book_flight(flight_time: str = "") -> dict:
-    order_id = f"FLT-{1000 + len(_booked_flights)}"
-    _booked_flights.append(flight_time)
-    return {
-        "status": "success",
-        "flight_time": flight_time,
-        "order_id": order_id,
-        "message": f"{flight_time} 航班预订成功，订单号 {order_id}",
-    }
-
-
-def tool_book_hotel(hotel_name: str = "", price_per_night: float = 0) -> dict:
-    confirmation_id = f"HTL-{2000 + len(_booked_hotels)}"
-    _booked_hotels.append(hotel_name)
-    return {
-        "status": "success",
-        "hotel_name": hotel_name,
-        "price_per_night": price_per_night,
-        "confirmation_id": confirmation_id,
-        "message": f"{hotel_name} 预订成功，确认号 {confirmation_id}",
-    }
 
 
 def tool_sync_calendar(event_title: str = "", date: str = "", time: str = "") -> dict:
@@ -220,18 +193,74 @@ def tool_send_confirmation_email(to: str = "", summary: str = "") -> dict:
     }
 
 
-TOOL_FUNCTIONS = {
-    "get_customer_info": tool_get_customer_info,
-    "get_my_calendar": tool_get_my_calendar,
-    "get_customer_calendar": tool_get_customer_calendar,
-    "get_travel_policy": tool_get_travel_policy,
-    "search_flight": tool_search_flight,
-    "search_hotel": tool_search_hotel,
-    "book_flight": tool_book_flight,
-    "book_hotel": tool_book_hotel,
-    "sync_calendar": tool_sync_calendar,
-    "send_confirmation_email": tool_send_confirmation_email,
-}
+def _make_booking_tools() -> dict:
+    """
+    每次任务开始时调用一次，返回一套只属于本次任务的 book_flight / book_hotel
+    工具函数。已预订记录（用于生成递增订单号）保存在闭包变量里，不写模块全局，
+    这样并发跑多个任务时彼此的预订状态不会互相污染。
+    """
+    booked_flights: list[str] = []
+    booked_hotels: list[str] = []
+
+    def tool_book_flight(flight_id: str = "") -> dict:
+        flights = MOCK_DATA["search_flight"]["flights"]
+        flight = next((f for f in flights if f["flight_id"] == flight_id), None)
+
+        if flight is None:
+            return {"status": "not_found", "reason": f"未找到航班 {flight_id}"}
+
+        if flight["booking_status"] != "available":
+            # 搜索时可见，下单时才发现被锁/售罄——这是环境状态变化，不是代码里
+            # 写死的"选这个就失败"分支；下一步怎么办完全交给模型现场判断。
+            return {
+                "status": "failed",
+                "reason": f"提交订单时航班 {flight_id}（{flight['departure_time']} 出发）已被其他用户锁定/售罄",
+                "flight_id": flight_id,
+            }
+
+        order_id = f"FLT-{1000 + len(booked_flights)}"
+        booked_flights.append(flight_id)
+        return {
+            "status": "success",
+            "flight_id": flight_id,
+            "departure_time": flight["departure_time"],
+            "arrival_time": flight["arrival_time"],
+            "price": flight["price"],
+            "order_id": order_id,
+            "message": f"航班 {flight_id}（{flight['departure_time']} 出发）预订成功，订单号 {order_id}",
+        }
+
+    def tool_book_hotel(hotel_id: str = "") -> dict:
+        options = MOCK_DATA["search_hotel"]["options"]
+        hotel = next((h for h in options if h["hotel_id"] == hotel_id), None)
+
+        if hotel is None:
+            return {"status": "not_found", "reason": f"未找到酒店 {hotel_id}"}
+
+        confirmation_id = f"HTL-{2000 + len(booked_hotels)}"
+        booked_hotels.append(hotel_id)
+        return {
+            "status": "success",
+            "hotel_id": hotel_id,
+            "hotel_name": hotel["hotel_name"],
+            "price_per_night": hotel["price_per_night"],
+            "confirmation_id": confirmation_id,
+            "message": f'{hotel["hotel_name"]} 预订成功，确认号 {confirmation_id}',
+        }
+
+    return {
+        "get_customer_info": tool_get_customer_info,
+        "get_my_calendar": tool_get_my_calendar,
+        "get_customer_calendar": tool_get_customer_calendar,
+        "get_travel_policy": tool_get_travel_policy,
+        "search_flight": tool_search_flight,
+        "search_hotel": tool_search_hotel,
+        "book_flight": tool_book_flight,
+        "book_hotel": tool_book_hotel,
+        "sync_calendar": tool_sync_calendar,
+        "send_confirmation_email": tool_send_confirmation_email,
+    }
+
 
 # 工具的 JSON Schema 定义（OpenAI 兼容模式下的 function calling 格式）
 TOOLS = [
@@ -288,14 +317,18 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_flight",
-            "description": "查询指定日期、指定期望出发时间附近的航班情况，返回是否可订、若不可订还有哪些备选时间等原始信息。",
+            "description": (
+                "搜索指定日期前往目的地的可选航班，返回完整候选列表（航班编号、出发/到达时间、"
+                "价格、查询时的余票状态）。该工具只负责提供候选信息，不会替你选择或预订航班。"
+                "你需要结合客户会面时间、出行安排和差旅预算自行比较后，再调用 book_flight。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "date": {"type": "string", "description": "出发日期，例如 '下周二'"},
-                    "preferred_time": {"type": "string", "description": "期望的出发时间，例如 '09:00'"},
+                    "destination": {"type": "string", "description": "到达城市，例如 '上海'"},
                 },
-                "required": ["date", "preferred_time"],
+                "required": ["date"],
             },
         },
     },
@@ -303,7 +336,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_hotel",
-            "description": "查询客户公司附近的酒店选项及价格，返回是否在预算内、若超预算还有哪些备选（可能距离更远但更便宜）。",
+            "description": (
+                "查询客户公司附近的酒店候选列表，每个候选都带 hotel_id、价格和 within_policy"
+                "（是否在差旅政策预算内）。预订时必须使用候选中真实存在的 hotel_id。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -318,13 +354,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "book_flight",
-            "description": "预订某个具体出发时间的航班。只应该在已经确认该时间段有票、且满足会面时间约束之后才调用。",
+            "description": (
+                "预订 search_flight 返回的某个具体航班，必须传入搜索结果中真实存在的 flight_id。"
+                "搜索结果只代表查询时的状态，提交订单时仍可能因实时库存变化而预订失败——遇到失败后，"
+                "应根据返回原因从之前的候选中重新选择，或重新搜索，不要放弃。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "flight_time": {"type": "string", "description": "要预订的出发时间，例如 '07:30'"},
+                    "flight_id": {"type": "string", "description": "要预订的航班编号，例如 'MU5101'"},
                 },
-                "required": ["flight_time"],
+                "required": ["flight_id"],
             },
         },
     },
@@ -332,14 +372,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "book_hotel",
-            "description": "预订某个具体酒店。如果该酒店价格在预算内可以直接调用；如果超出差旅政策的每晚预算上限，必须先调用 request_human_approval 获得批准之后才能调用这个工具，不能自己直接下单。",
+            "description": (
+                "预订某个具体酒店，必须传入 search_hotel 返回的候选中真实存在的 hotel_id。"
+                "如果该酒店超出差旅政策的每晚预算上限（候选中 within_policy 为 false），必须先调用"
+                " request_human_approval 获得批准之后才能调用这个工具，不能自己直接下单。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "hotel_name": {"type": "string", "description": "要预订的酒店名称"},
-                    "price_per_night": {"type": "number", "description": "该酒店每晚价格"},
+                    "hotel_id": {"type": "string", "description": "要预订的酒店编号，例如 'HTL-C'"},
                 },
-                "required": ["hotel_name", "price_per_night"],
+                "required": ["hotel_id"],
             },
         },
     },
@@ -429,6 +472,9 @@ SYSTEM_PROMPT = """你是一个商务拜访执行 Agent，负责帮用户把一�
    不调用工具、且所有事项都已办妥，才代表任务真正结束。如果任务还没办妥而你这一
    轮没有调用工具（比如你在等用户回答一个问题），系统会把它当作"等待用户回复"，
    而不是任务结束，你之后依然可以正常调用工具继续推进。
+7. 航班安排需要遵循"先搜索候选、比较约束、再预订"的流程：不要凭空猜测航班时间，
+   必须使用 search_flight 返回的真实 flight_id 调用 book_flight。预订失败不代表
+   任务失败，从之前的候选中重新选择，或重新搜索，都是合理的下一步。
 """
 
 FINAL_REPORT_PROMPT = """你是同一个商务拜访执行 Agent，本次任务的所有动作已经执行完毕，现在需要你输出
@@ -477,10 +523,10 @@ MAX_TURNS = 16  # 只统计"真正调用了模型"的轮次，不包含等待用
 
 
 # ------------------------------------------------------------------
-# Checklist（Verifier）：对照方案书第四节的 5 项完成标准。
+# Checklist（Verifier）：任务是否完成的判断标准。
 #
-# 注意这里判断"打没打勾"的逻辑，只是在核对客观结果（工具是不是返回了 success），
-# 不涉及"接下来该做什么"的决策——那部分完全由模型的推理文字决定。
+# 这里只核对客观结果（工具是不是返回了 success），不涉及"接下来该做什么"的
+# 决策——那部分完全由模型的推理文字决定。
 # ------------------------------------------------------------------
 CHECKLIST_LABELS = {
     "flight": "航班已确认",
@@ -538,8 +584,8 @@ def _format_approval_records(approval_records: list[dict]) -> str:
 
 async def generate_final_report(goal: str, checklist: dict, action_log: list[dict], approval_records: list[dict]) -> dict:
     """
-    Phase 5：五项 Checklist 全部完成后，再单独调用一次模型（不带 tools），让它基于
-    这次任务真实发生的工具调用历史和审批记录，生成执行层/决策层二分报告。
+    五项 Checklist 全部完成后调用一次模型（不带 tools），让它基于这次任务真实
+    发生的工具调用历史和审批记录，生成执行层/决策层二分报告。
 
     这次调用刻意不复用主循环的 messages 历史，而是重新组织一份干净的"事实清单"
     喂给模型——这样即使主循环的上下文已经很长，报告依然会紧扣真实发生的事情，
@@ -590,38 +636,40 @@ async def run_agent_loop(
 ):
     """
     核心循环：调用模型 → 它说要用哪个工具 → 执行工具 → 把结果丢回去 → 重复，
-    直到它不再调用工具**并且** Checklist 全部满足（代表它认为完成了）。
+    直到它不再调用工具**并且** Checklist 全部满足（代表任务真正完成）。
 
-    这个循环里依然没有任何 if "航班满员" / "酒店超预算" then ... 这样的业务
-    分支，所有"失败之后怎么办"都是模型自己在推理文字里现场决定的，代码只负责
-    机械地执行它选的工具，以及在旁边核对客观结果、更新 Checklist。
+    这个循环里没有任何 if "航班满员" / "酒店超预算" then ... 这样的业务分支，
+    所有"失败之后怎么办"都是模型自己在推理文字里现场决定的，代码只负责机械地
+    执行它选的工具，以及在旁边核对客观结果、更新 Checklist。
 
-    Phase 4：如果模型调用的是 `request_human_approval`，代码不会立即返回结果，
+    人工审批：如果模型调用的是 `request_human_approval`，代码不会立即返回结果，
     而是把请求推给前端、真正暂停在 `await approval_queue.get()` 上，直到用户在
     网页上点了"批准/拒绝"，这个选择（连同可选的一句补充说明）才会作为下一个
     Observation 喂回模型。
 
-    Phase 5：`action_log` 和 `approval_records` 会记录本次任务真实发生的每一次
-    工具调用和每一次审批，任务结束时用来生成执行层/决策层报告。
+    `action_log` 和 `approval_records` 记录本次任务真实发生的每一次工具调用和
+    每一次审批，任务结束时用来生成执行层/决策层报告。
 
-    Phase 6.5（会话延续）：模型"这一轮没有调用工具"不再被无条件当成"任务结束"。
-    只有同时满足"没调用工具" + "Checklist 全部完成"，才真正 done、销毁上下文、
-    return。如果没调用工具但 Checklist 还没满，说明模型是在用文字向用户提问、
-    等待回复（最典型的触发点是审批被拒绝之后），此时代码会把这一状态推给前端，
-    真正暂停在 `await reply_queue.get()` 上，等用户在网页上继续说话，再把这句
-    话追加进**同一份** `messages`、`continue` 回到循环顶部——不会新建 messages，
-    不会丢失之前查过的客户信息、已订的航班酒店记录。
+    会话延续：模型"这一轮没有调用工具"不会被无条件当成"任务结束"。只有同时
+    满足"没调用工具" + "Checklist 全部完成"，才真正 done、销毁上下文、return。
+    如果没调用工具但 Checklist 还没满，说明模型是在用文字向用户提问、等待回复
+    （最典型的触发点是审批被拒绝之后），此时代码会把这一状态推给前端，真正
+    暂停在 `await reply_queue.get()` 上，等用户在网页上继续说话，再把这句话
+    追加进**同一份** `messages`、`continue` 回到循环顶部——不会新建 messages，
+    不会丢失之前查过的客户信息、已订的航班酒店记录。approval_queue 和
+    reply_queue 是同一种"挂起等用户"机制，只是一个等的是按钮点击、一个等的
+    是一段文字。
     """
-    global _booked_flights, _booked_hotels
-    _booked_flights = []
-    _booked_hotels = []  # 每次新任务开始，清空模拟的预订记录
-
     if client is None:
         await send(
             websocket, "error",
             text="⚠️ 还没配置 QWEN_API_KEY，请在项目根目录的 .env 文件里填好之后重启程序。",
         )
         return
+
+    # 每个任务拥有独立的工具函数（尤其是 book_flight / book_hotel 的预订记录），
+    # 避免并发任务之间互相污染状态。
+    tool_functions = _make_booking_tools()
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -694,9 +742,9 @@ async def run_agent_loop(
             await send(websocket, "tool_call", name=name, arguments=args)
 
             if name == "request_human_approval":
-                # Phase 4 的核心：这里真正暂停，等用户在网页上点按钮。代码不判断
-                # "该不该批准"，那是用户的决定；代码也不判断"要不要发起审批"，那
-                # 是模型刚才自己决定的——代码只是搭一座桥，把两边接起来。
+                # 真正暂停，等用户在网页上点按钮。代码不判断"该不该批准"，那是
+                # 用户的决定；代码也不判断"要不要发起审批"，那是模型刚才自己
+                # 决定的——代码只是搭一座桥，把两边接起来。
                 reason = args.get("reason", "")
                 proposed_action = args.get("proposed_action", "")
                 await send(websocket, "approval_request", reason=reason, proposed_action=proposed_action)
@@ -727,7 +775,7 @@ async def run_agent_loop(
                 })
                 await send(websocket, "approval_resolved", approved=approved)
             else:
-                func = TOOL_FUNCTIONS.get(name)
+                func = tool_functions.get(name)
                 if func is None:
                     result = {"status": "error", "message": f"未知工具：{name}"}
                 else:
@@ -755,7 +803,7 @@ async def run_agent_loop(
     await send(
         websocket, "error",
         text=f"⚠️ 已经调用了 {MAX_TURNS} 次模型还没结束，可能陷入了重复尝试，已强制停止。"
-             f"这种情况本身就是 Phase 6 要记录的一类 Bad Case（重复失败/死循环）。",
+             f"这种情况本身就是一类值得记录的 Bad Case（重复失败/死循环）。",
     )
 
 
@@ -772,8 +820,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
     这里维护两个 asyncio.Queue，分别对应 run_agent_loop 里两种不同的"暂停等
     用户"的场景：
-    - approval_queue：等审批卡片的"批准/拒绝"（Phase 4）
-    - reply_queue：等用户在"模型反问、任务未结束"时继续说话（Phase 6.5 新增）
+    - approval_queue：等审批卡片的"批准/拒绝"
+    - reply_queue：等用户在"模型反问、任务未结束"时继续说话
     两者机制完全一样，只是 payload 类型不同（dict vs 纯文本），这样前端在任务
     还没真正结束时，用户的每一句话都能路由回**同一个** run_agent_loop 任务，
     而不是又开一个新任务、丢掉之前的上下文。
@@ -816,8 +864,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
             elif msg_type == "user_reply":
-                # Phase 6.5 新增：任务还在进行中（模型在等回复）时，用户发来的
-                # 后续消息走这里，续进同一个 run_agent_loop，而不是 start_task。
+                # 任务还在进行中（模型在等回复）时，用户发来的后续消息走这里，
+                # 续进同一个 run_agent_loop，而不是 start_task。
                 text = (payload.get("text") or "").strip()
                 if text:
                     await reply_queue.put(text)

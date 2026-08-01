@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>商务拜访执行 Agent - Phase 6.5</title>
+<title>商务拜访执行 Agent</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -335,7 +335,7 @@
 <body>
   <div class="wrap">
     <h1>商务拜访执行 Agent</h1>
-    <div class="sub">Phase 4/5/6.5 · 人工审批卡片 + 执行层/决策层最终报告 + 会话延续 —— 该不该申请审批、审批被拒后怎么办、要不要反问用户，都由模型现场决定；批不批准、怎么回答，是你的决定</div>
+    <div class="sub">人工审批卡片 + 执行层/决策层最终报告 + 会话延续 —— 该不该申请审批、审批被拒后怎么办、要不要反问用户，都由模型现场决定；批不批准、怎么回答，是你的决定</div>
     <div class="status">
       <span class="dot" id="dot"></span>
       <span id="status-text">连接中…</span>
@@ -389,7 +389,7 @@
 
   let thinkingEl = null;
 
-  // Phase 6.5：输入框现在有两种模式——
+  // 输入框有两种模式——
   // "idle"：还没开始任务 / 上一个任务已结束，点按钮 = 开一个新任务（start_task）
   // "reply"：当前任务还在进行、模型在等用户回话（awaiting_reply），点按钮 = 把
   //          输入框内容作为 user_reply 续进同一个任务，不会新建任务
@@ -472,9 +472,10 @@
     return entry;
   }
 
-  // Phase 4 + 6.5：渲染一张审批卡片。拒绝按钮旁边加了一个可选的文本框，
-  // 用户可以直接写一句反馈（比如"改成更便宜的酒店"）随拒绝一起带给模型，
-  // 不填也完全可以——不填的话模型如果需要更多信息，会转到"等待回复"模式反问。
+  // 渲染一张审批卡片。拒绝按钮旁边加了一个可选的文本框，用户可以直接写一句
+  // 反馈（比如"改成更便宜的酒店"）随拒绝一起带给模型，减少一轮"模型反问→
+  // 用户在等待回复里再答一次"的往返；不填也完全可以——不填的话模型如果需要
+  // 更多信息，会转到"等待回复"模式反问。
   function renderApprovalCard(reason, proposedAction) {
     if (placeholder) placeholder.remove();
     const card = document.createElement("div");
@@ -513,7 +514,7 @@
     return card;
   }
 
-  // Phase 5：渲染执行层/决策层最终报告
+  // 渲染执行层/决策层最终报告
   function renderFinalReport(executionLayer, decisionLayer) {
     if (placeholder) placeholder.remove();
     const card = document.createElement("div");
@@ -592,7 +593,7 @@
       // 卡片自己在点击时已经就地更新了状态，这里不需要额外处理
 
     } else if (data.type === "awaiting_reply") {
-      // Phase 6.5 核心：Checklist 还没满，模型没调用工具，说明它在等用户说话。
+      // 核心逻辑：Checklist 还没满，模型没调用工具，说明它在等用户说话。
       // 任务并没有结束，只是切换到"等待回复"模式，解锁输入框但不当成新任务。
       clearThinking();
       appendEntry(
@@ -633,7 +634,7 @@
     if (!value || ws.readyState !== WebSocket.OPEN) return;
 
     if (inputMode === "reply") {
-      // Phase 6.5：续进当前正在进行的任务，而不是开一个新任务
+      // 续进当前正在进行的任务，而不是开一个新任务
       ws.send(JSON.stringify({ type: "user_reply", text: value }));
       setInputMode("running");
     } else if (inputMode === "idle") {

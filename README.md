@@ -1,239 +1,80 @@
-# Phase 4 + 5 + 6.5 运行说明
+# Business Trip Execution Agent
 
-Phase 3 补齐了全部工具、加了 Checklist 侧边栏。Phase 4/5 加上了人工审批卡片和
-执行层/决策层最终报告。这一步（**Phase 6.5**）修的是一个会话管理层面的架构漏洞：
-之前"模型这一轮没调用工具"会被无条件当成"任务已完成"，导致模型反问用户时
-（最容易在审批被拒绝之后出现）任务被错误地判定结束、上下文被销毁，用户接下来
-说的话只能开一个全新的空任务，表现为模型"失忆"。详见文末「Phase 6.5：问题记录
-与修复方案」一节，以及项目里同名的独立设计文档。
+> An AI agent that autonomously completes a business trip arrangement by dynamically planning, replanning from raw tool observations, requesting human approval before irreversible or out-of-policy actions, and verifying task completion against an explicit checklist — not a chatbot, not a workflow, not a function-calling demo.
 
-## 这一步（Phase 6.5）做了什么
+差旅拜访只是这个 agent 承载的一个具体场景；它要证明的是一个更通用的能力：给一句目标，agent 自己规划、自己在失败后重新决策、该停下来问人的时候真的会停下来等你确认。
 
-### 1）根因修复：用 Checklist 状态区分"真完成"和"在等用户回复"
+---
 
-`main.py` 的 `run_agent_loop` 里，判断任务是否结束的逻辑从：
+## Demo
 
-```python
-if not message.tool_calls:
-    # 没调用工具 = 任务结束（错的：没考虑"模型在反问"这种情况）
-    ...
-    return
+*(截图 / GIF 占位 — 建议放三张：推理文字高亮的执行过程、人工审批卡片、最终报告)*
+
+```
+[ Screenshot 1: Live reasoning + tool call log ]
+[ Screenshot 2: Human approval card ]
+[ Screenshot 3: Execution layer / Decision layer final report ]
 ```
 
-改成：
+---
 
-```python
-if not message.tool_calls:
-    if all(checklist.values()):
-        # 真的做完了：生成报告 → done → return
-        ...
-        return
-    else:
-        # Checklist 没满，模型是在等用户回复，不能 return
-        await send(websocket, "awaiting_reply")
-        user_text = await reply_queue.get()   # 真正卡住，等前端发来 user_reply
-        messages.append({"role": "user", "content": user_text})
-        continue   # 续进同一份 messages，不新建、不清空
+## Key Features
+
+- **Dynamic Replanning** — 每次工具调用的失败原因都以原始数据（原始 JSON / 报错文本）交给模型，不做任何预判断；下一步怎么办完全是模型现场推理决定的，代码里没有一行 `if 航班满 then ...` 这种业务分支。
+- **Explicit Verifier** — 任务是否完成由一份可勾选的 5 项 Checklist 决定（航班 / 酒店 / 会面时间 / 日历同步 / 确认邮件），而不是"流程跑完就算完成"这种隐式判断。
+- **Human-in-the-loop Approval** — 超预算、或即将对客户发出不可撤回的外部动作（发确认邮件）之前，agent 会主动暂停，弹出审批卡片说明理由，等待用户批准或拒绝才继续。
+- **Session Continuation** — 当模型因为缺信息而反问用户（而不是任务真正完成）时，会话状态和历史上下文会被正确保留，用户的后续回复会续进同一个任务，而不是丢失上下文重新开始。
+- **Execution Layer vs. Decision Layer Reporting** — 任务结束时的总结报告会明确区分"有客观依据、可验证的事实"（订单号、确认号）和"需要人工复核的取舍判断"（为什么选了这个方案），而不是笼统地说"已完成"。
+
+---
+
+## Architecture
+
+```
+Goal（一句话，不给步骤）
+   ↓
+Plan（模型自主拆解任务）
+   ↓
+Action（调用工具执行）
+   ↓
+Observation（原始返回结果，成功或失败）
+   ↓
+Verifier（对照 Checklist 检查完成状态）
+   ├─ 未满足 → 原始 Observation 喂回模型 → 模型重新 Plan → 回到 Action
+   ├─ 需要人工判断 → 暂停等待 Human Approval → 通过后继续 Action
+   └─ 全部满足 → 生成执行层/决策层报告 → Done
 ```
 
-新增了一个 `reply_queue`（和原有的 `approval_queue` 机制完全一样，只是这次等的
-是一段文字而不是布尔值），`run_agent_loop` 的函数签名也相应从
-`(websocket, goal, approval_queue)` 变成 `(websocket, goal, approval_queue, reply_queue)`。
+**Tech stack**: FastAPI + WebSocket backend for real-time streaming · single-page HTML/JS frontend · Qwen (OpenAI-compatible tool-use API) · 10 mock business tools + 1 approval tool, covering CRM lookup, calendar checks, travel policy, flight/hotel search & booking, calendar sync, and email confirmation.
 
-`websocket_endpoint` 里新增了一种消息类型 `user_reply`（区别于开新任务用的
-`start_task`），收到后塞进 `reply_queue`，唤醒挂起在 `await reply_queue.get()`
-上的 `run_agent_loop`：
+---
 
-```python
-elif msg_type == "user_reply":
-    text = (payload.get("text") or "").strip()
-    if text:
-        await reply_queue.put(text)
-```
-
-`MAX_TURNS`（16 轮）现在只统计"真正调用了模型"的次数，等待用户回复、等待审批
-的时间不计入轮次预算——用一个独立的 `model_calls` 计数器替代了原来直接用
-`for turn in range(MAX_TURNS)` 的写法。
-
-### 2）前端：输入框现在有"开新任务 / 续说当前任务"两种模式
-
-`static/index.html` 新增一个 `inputMode` 状态机（`idle` / `reply` / `running`）：
-
-- 收到后端的 `awaiting_reply` 消息 → 切到 `reply` 模式：解锁输入框、按钮文案变成
-  "发送回复"、输入框边框高亮提示"模型在等你回话，任务还没结束"
-- 在 `reply` 模式下点发送 → 发送 `{"type": "user_reply", "text": ...}`，**不是**
-  `start_task`，续进同一个后台任务
-- 后端确认收到后会广播一条 `user_reply` 消息，前端据此把用户刚才说的话渲染成
-  一条日志（视觉上和"目标"条目同款，都代表"用户说的话"），保证日志流不断裂
-- 任务真正 `done`/`error` 时才切回 `idle` 模式，此时点按钮才是开一个全新任务
-
-### 3）体验优化（非必须）：审批卡片"拒绝"按钮旁加了一个可选反馈框
-
-拒绝审批时，如果用户顺手写了一句想法（比如"改成更便宜的酒店"），会随
-`approval_response` 一起发给后端，作为 `user_note` 附加进喂给模型的 Observation
-文本里；不写也完全可以，模型如果因此缺信息，会走上面的"等待回复"流程反问。
-
-这条优化**不违反**"下一步怎么办必须由模型现场推理"的红线：代码没有替模型判断
-"该怎么改方案"，只是多传了一条用户主动提供的信息，模型收到之后依然要自己决定
-怎么用这条信息、要不要用。
-
-## 1. 安装依赖（和之前一样，没有新增）
+## Quick Start
 
 ```bash
-cd /Users/lll/Desktop/business_trip_agent
-source venv/bin/activate
+git clone <this-repo>
+cd business_trip_agent
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## 2. 运行
+在项目根目录创建 `.env`，填入你的 Qwen API Key：
+
+```
+QWEN_API_KEY=your_key_here
+```
+
+运行：
 
 ```bash
 python main.py
 ```
 
-浏览器打开 http://127.0.0.1:8000
-
-## 3. 验收步骤（延续 Phase 4/5，新增第 7、8 步验证 Phase 6.5）
-
-1. 页面顶部圆点变绿、显示"已连接"。
-2. 输入框里已经预填了目标，直接点"开始任务"。
-3. 观察日志流：模型查客户信息、双方日程、差旅政策，然后搜索航班（遇到满员，
-   自己改订 07:30）、搜索酒店（遇到超预算的近距离选项，但 mock 数据里还给了
-   一个 780 元、在预算内、距离稍远（1.8km）的选项）。
-
-4. **关键验收点 1（酒店这一步允许出现两条合法路径，都算通过）**：
-
-   跑一次流程，实际会落在下面两条路径之一，**两条都算验收通过**：
-
-   - **路径 A（更常见）：模型判断"有合规选项就该用"，直接预订银城中路商务
-     酒店（780 元），不触发审批。**
-     验收方式：日志流里应该能看到模型的推理文字明确对比了三个选项的价格和
-     距离，说明了"为什么选这个而不是更近但超预算的两个"。工具调用应该是
-     `book_hotel(hotel_name="银城中路商务酒店", price_per_night=780)`，中间
-     **不会**出现酒店相关的 `request_human_approval` 调用——这是对的。
-
-   - **路径 B（模型判断"离客户更近"的价值更高时会走这条）：模型选择超预算
-     的近距离酒店（950 或 920 元），调用 `request_human_approval`，网页弹出
-     黄色卡片，展示理由和打算预订哪个酒店。**
-     验收方式：程序应该真的停住——不点按钮，日志流不会继续往下走。点"批准"
-     后卡片变灰显示"✓ 已批准"，日志流继续，模型会真的去预订那个超预算酒店。
-
-5. 无论走的是路径 A 还是路径 B，继续往后，都应该再看到一次审批卡片——发
-   确认邮件之前的最终确认（这一步是硬性规则，不管酒店怎么选都必须走）。
-   批准后邮件发送成功，Checklist 五项应该全部打勾。
-
-6. **关键验收点 2（最终报告是不是基于真实记录写的）**：全部完成后，应该看到
-   一张"完成"日志之前多了一张报告卡片，✅ 执行层部分应该能对上你刚才实际看到
-   的订单号/确认号/event_id/message_id；⚠️ 决策层部分应该提到具体的取舍或
-   审批细节，而不是空话。
-
-7. **关键验收点 3（Phase 6.5：审批拒绝后会话是否正确延续，不再"失忆"）**：
-   正常跑一次流程，在触发审批卡片时，拒绝时**不填**反馈框，
-   直接点"拒绝"。观察：
-   - 日志流应该出现一条"等待回复"提示，而**不是**直接出现"完成"或错误提示；
-   - 输入框应该被解锁，按钮文案变成"发送回复"；
-   - 在输入框里回复一句话（比如"预算允许提高到 950，直接订陆家嘴中心大酒店"），
-     点发送，观察模型的回复是否**记得**之前查过的客户信息、日历、已经订好的
-     航班——不应该出现"请问您要拜访哪家客户"这类失忆式反问；
-   - Checklist 侧边栏在整个"等待回复"过程中应该保持之前的勾选状态，不会被清空；
-   - 继续往下，任务应该能正常走到全部 Checklist 打勾、生成最终报告、`done`。
-
-8. **关键验收点 4（Phase 6.5 体验优化：拒绝时附带反馈，减少一轮反问）**：
-   再跑一次，这次在审批卡片拒绝时，在文本框里写一句具体反馈（比如"改成更便宜、
-   离地铁站近的酒店"）再点拒绝。观察模型是否直接根据这句反馈调整方案继续执行，
-   而不需要再反问、再等一轮用户输入——这条不是必须通过的硬性指标，但如果模型
-   确实用上了这句反馈，是一个很好的演示素材。
-
-## 4. 其它说明
-
-- `MAX_TURNS` 仍是 16，但现在只统计"真正调用模型"的次数，等待审批、等待用户
-  回复的时间不计入轮次预算。
-- 如果你在等审批卡片或等回复的过程中刷新页面或断开连接，后台任务不会自动
-  清理记录——这是一个已知的简化，demo 场景下不需要处理更复杂的会话恢复逻辑。
-- Phase 6 迭代记录整理（方案书 6.1/6.2 的四类 Bad Case 表格）仍然是文档工作，
-  建议在你跑验收步骤时把模型判断错的地方随手记录，最后整理进那张表。
-- 本次 Phase 6.5 发现的问题**不属于**方案书 6.1 定义的四类 Bad Case（那四类都是
-  "模型判断错了"），而是"产品的会话管理机制之前没做完整，模型的判断其实是对
-  的"——面试展示时建议把这两者分开讲清楚，参见文末说明。
-
-## 文件说明
-
-| 文件 | 作用 |
-|---|---|
-| `main.py` | 后端：11 个工具（10 个假工具 + 1 个 `request_human_approval` 特殊工具），`run_agent_loop` 是核心循环（Phase 6.5 新增了"Checklist 未满时挂起等用户回复"的分支），`generate_final_report` 负责 Phase 5 的报告生成，`websocket_endpoint` 新增了 `user_reply` 消息路由 |
-| `static/index.html` | 前端：审批卡片（新增可选反馈文本框）、最终报告卡片、Phase 6.5 新增的"等待回复"状态提示和输入框模式切换 |
-| `requirements.txt` | 依赖清单（和之前相同） |
-| `.env` | 存放真实 Key（沿用之前已经配置好的，不用重新配） |
+浏览器打开 `http://127.0.0.1:8000`，输入框已预填一个示例目标，点"开始任务"即可看到完整过程。
 
 ---
 
-## Phase 6.5：问题记录与修复方案（完整版）
+## Design
 
-> 这一节是独立设计文档的内容，收进 README 方便一次性查阅；同样内容也单独存了
-> 一份 `PHASE6.5_设计与修复记录.md`，两者内容一致。
-
-### 观察到的现象
-
-**现象 A**：跑通主流程到"发送确认邮件"前的审批卡片，用户点了"拒绝"。模型的
-反应是列出已完成的事项，然后反问用户希望怎么调整，等待回答——这一步模型的
-判断本身是对的（缺信息、需要用户确认，选择用文字提问是合理的现场决策）。
-
-**现象 B**：用户回复模型的问题之后，模型表现得像"失忆"了——之前查过的客户
-信息、已经订好的航班酒店全部不记得，反过来问"请问拜访哪家客户"。
-
-### 根因
-
-`main.py` 里"模型这一轮没有调用工具"被无条件当成"任务已经完成"：
-
-```python
-if not message.tool_calls:
-    if all(checklist.values()):
-        ...
-    await send(websocket, "done")
-    return   # 问题：不管 checklist 满没满，都直接 return，messages 被销毁
-```
-
-"没调用工具"这一个信号，实际对应两种完全不同的情况——(a) 任务真的做完了；
-(b) 模型缺信息、在等用户回话。旧代码只认 (a)。现象 A 发生时，模型合理地选择
-"不调用工具、用文字提问"，但代码把这次当成任务结束、销毁了 `messages`；用户
-下一句话只能走 `start_task` 开一个全新的空上下文任务，于是有了现象 B——模型
-不是真的失忆，它是在一个全新的、上下文为空的任务里诚实地反映"我不知道这是
-哪个客户"。
-
-**这不是"审批拒绝"这个场景专属的问题**：只要模型在任何时刻因为信息不足选择
-反问（哪怕是 Checklist 还是 0/5 时），都会触发一模一样的链路。本次验收里现象
-B 恰好发生在审批拒绝之后，只是因为这是流程里第一次出现"模型需要反问用户"的
-情况，不代表这个漏洞只在审批拒绝路径上存在。
-
-### 修复方案
-
-已在本次改动中实现，见上文"这一步（Phase 6.5）做了什么"一节，核心是：
-
-1. 【必做/根因修复】不再单独用"有没有调用工具"判断任务是否结束，而是叠加
-   Checklist 完成度——没调用工具但 Checklist 未满时，挂起等待用户在**同一个**
-   任务里继续说话，而不是销毁上下文、逼用户开新任务。
-2. 【可选/体验优化】审批拒绝时允许用户附带一句话反馈，减少一轮反问往返。
-
-两条修复都完全遵守"下一步该怎么办必须是模型现场推理决定"的红线：代码没有
-替模型判断"该怎么回答用户""该怎么改方案"，只是在管理会话状态——什么时候
-算真结束、什么时候该把新消息续进同一个上下文——这是工程管道层面的事，不是
-业务判断。
-
-### 这份记录在整体计划里的位置，以及面试展示口径
-
-对应方案书 6.1 定义的四类 Bad Case（审批遗漏 / Observation 误读 / 重复失败
-死循环 / 结论型错误）——**Phase 6.5 记录的问题不属于这四类**，那四类都是
-"模型判断错了"，而这里是"产品的会话管理机制之前没做完整，模型的判断其实
-是对的"。面试展示时建议把这两者分开讲：这不是 Prompt 没调好，是这一版之前
-还没有支持"多轮追问"这个功能，现在补上了。
-
-### 验收方式
-
-- 审批拒绝后不给用户输入任何东西，直接观察：程序是不是停在"等待回复"状态，
-  而不是直接弹出"完成"。
-- 在"等待回复"状态下，用户输入一句改动要求，观察：模型的回复里是否还记得
-  之前查过的客户信息、已订的航班酒店信息（不应该再反问"拜访哪家客户"）。
-- Checklist 侧边栏在整个"等待回复"过程中应该保持之前的勾选状态，不应该被
-  清空。
-- 全部 Checklist 打勾之后，模型不调用工具，此时才应该看到
-  `generating_report` → `final_report` → `done`。
+设计动机、Verifier 的具体判断逻辑、两个刻意设计的失败点（航班满员、酒店超预算）、以及为什么选择一个"成熟"场景而不是标新立异的场景，详见 [`DESIGN.md`](./DESIGN.md)。
