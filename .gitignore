@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+eval_logs/
+eval result/
+Agent_Evaluation_Framework_Design.docx
