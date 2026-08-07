@@ -21,6 +21,37 @@
 
 以上四点全部通过同一种机制实现：代码只管理"什么时候该暂停、暂停之后从哪里
 继续"这类会话状态，从不替模型做业务判断。
+
+- **预订工具的幂等性**：`book_flight` / `book_hotel` 对同一个 id 的重复调用
+  会原样返回第一次的成功结果（同一个订单号），而不是重新走一遍下单逻辑，
+  避免了"模型出于确认心理重复调用"被误判为二次下单、造成资损。
+- **Prompt Caching**：messages 结构天然满足"稳定前缀（system prompt + tools
+  schema）在前、变化内容在后"，自动享受网关的隐式缓存；`PROMPT_CACHE_MODE=
+  explicit` 时会额外通过 `extra_body.cache_control` 显式声明缓存粒度。
+- **备用模型自动切换**：只识别"额度耗尽"这一类特征明确的错误，一旦命中就
+  让当前任务以 `infra_error` 结束（不在同一次运行内部换模型），下一次任务
+  会自动使用 `QWEN_BACKUP_MODEL`；`done` 事件里带 `model_used` 字段，方便
+  事后区分"模型本身不稳定"和"中途切换了模型版本"。
+- **审批的运行时硬约束（安全护栏）**：`classify_approval_purpose`（定义在
+  `approval_utils.py`，与 `harness.py` 共用同一份实现）判定一次已批准的审批
+  是否属于"酒店超预算"，结果记录在 `approval_state` 里；`tool_book_hotel`
+  在真正下单前会检查价格是否超出政策上限、且本次任务是否已获批准，未获批准
+  直接拒绝下单，而不是依赖模型自觉遵守 prompt。这条护栏和"失败之后怎么办
+  交给模型现场推理"这一设计原则并不冲突——两者划的是"业务判断"（交给模型）
+  和"安全底线"（代码硬约束）两类不同的分支，后者是"未经审批不能真的把
+  超支订单点下去"这种绝对不能发生的事，不该赌模型一定会听话。
+- **最终报告的事实核验**：`generate_final_report` 生成报告后，会用
+  `find_fabricated_ids`（同样定义在 `approval_utils.py`）核对 execution_layer
+  里提到的订单号/确认号等编号是否在本次任务的 `action_log` 里真实出现过，
+  一旦发现编造的编号，就把提示追加进 decision_layer 标红降级展示，而不是
+  悄悄相信模型没有幻觉。
+- **超时的业务层重试**：`_is_timeout_error` 命中时，在 SDK 层的连接重试
+  （`max_retries=1`）之外，再套一层"这一轮模型调用最多重试
+  `QWEN_TIMEOUT_MAX_RETRIES` 次、每次退避
+  `QWEN_TIMEOUT_RETRY_BACKOFF_SECONDS * 次数` 秒"的业务层重试，只在超时错误
+  上生效（配额错误不重试，依旧直接 infra_error + 切换备用模型）；重试用尽
+  后仍然正确降级为 `infra_error`，避免"网络抖一下、整个任务就没了"，但也
+  不会掩盖真正持续的超时问题。
 """
 
 import asyncio
@@ -33,7 +64,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
+
+from approval_utils import classify_approval_purpose, find_fabricated_ids
 
 load_dotenv()
 
@@ -53,9 +86,157 @@ QWEN_BASE_URL = os.environ.get(
 )
 QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3.7-max")
 
+# ------------------------------------------------------------------
+# 单次请求超时（对应 eval 报告"慢请求看起来像卡死"问题）
+#
+# 之前 OpenAI(...) 没有传 timeout，SDK 默认超时时间很长（量级是分钟级别），
+# 网关一旦排队/限流/负载高，单次调用可能挂几分钟才返回——期间终端完全没有
+# 任何输出，只能凭感觉判断"是慢还是死"。这里显式给一个较短的超时（默认 90
+# 秒，可通过 QWEN_REQUEST_TIMEOUT 覆盖），配合下面的 _is_timeout_error 识别，
+# 让"慢请求"在可控时间内变成一个明确的异常，而不是无限期挂起。
+#
+# max_retries 显式设成 1（而不是 SDK 默认的 2 次+指数退避）：重试次数越多，
+# "看起来卡死"的总等待时间越长，跟这里想解决的问题背道而驰；保留 1 次重试
+# 是为了兼顾单次网络抖动，不是完全不重试。
+# ------------------------------------------------------------------
+QWEN_REQUEST_TIMEOUT = float(os.environ.get("QWEN_REQUEST_TIMEOUT", "90"))
+
+# ------------------------------------------------------------------
+# 超时的"业务层重试"（对应 eval 报告"超时错误可以先重试、而不是直接判
+# infra_error 结束整个任务"）：
+#
+# openai SDK 的 max_retries=1 是连接层面的重试，跟这里要加的重试不是一回事。
+# 这里是在 SDK 那层重试都用完、APITimeoutError（或带 timeout 字样的异常）
+# 真正抛到 run_agent_loop 之后，再套一层"这一轮模型调用最多重试 N 次"的
+# 循环——只在 _is_timeout_error(exc) 为真时重试，配额错误（_is_quota_error）
+# 依旧不重试、直接 infra_error+切模型，两者不是同一类错误，不应该用同一套
+# 处理逻辑。重试次数用尽后依然正确降级为 infra_error，不会掩盖真正持续的
+# 超时问题。
+# ------------------------------------------------------------------
+QWEN_TIMEOUT_MAX_RETRIES = int(os.environ.get("QWEN_TIMEOUT_MAX_RETRIES", "2"))
+QWEN_TIMEOUT_RETRY_BACKOFF_SECONDS = float(os.environ.get("QWEN_TIMEOUT_RETRY_BACKOFF_SECONDS", "2"))
+
 client: OpenAI | None = None
 if QWEN_API_KEY:
-    client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+    client = OpenAI(
+        api_key=QWEN_API_KEY,
+        base_url=QWEN_BASE_URL,
+        timeout=QWEN_REQUEST_TIMEOUT,
+        max_retries=1,
+    )
+
+
+# ------------------------------------------------------------------
+# Prompt Caching 配置（对应 eval 报告 方案 4 长期）
+#
+# 已与网关维护方确认：阿里云百炼（DashScope 兼容模式）对该专属部署同时支持
+# 隐式缓存与显式缓存，计费上命中部分按 cached_token 折扣价结算：
+#   - 隐式缓存（implicit）：不需要任何额外参数，网关自动识别"请求前缀"是否
+#     与近期请求重复并命中缓存。唯一的硬约束是：把不变的内容（system prompt、
+#     tools schema）放在请求最前面，会变化的内容（本轮新增的 tool 结果/用户
+#     输入）放在最后——这一点本来就是 messages 列表自然增长的方式（system→
+#     goal→逐轮 assistant/tool），本身已经满足，不需要额外改动。
+#     该专属部署触发隐式缓存的最小前缀长度约为 1000 token（qwen-max 系列），
+#     所以只有 SYSTEM_PROMPT + TOOLS schema 这类"体量较大且稳定"的前缀才有
+#     实际收益，短对话不会命中，这是符合预期的。
+#   - 显式缓存（explicit）：通过 OpenAI 兼容接口的 extra_body 传
+#     `cache_control` 参数，自定义 cache_key 和过期时间，可以更主动地控制
+#     缓存粒度和生命周期，不依赖"最近是否有相同前缀的请求"这种命中概率。
+#
+# PROMPT_CACHE_MODE 三选一：
+#   - "implicit"（默认）：什么都不用做，天然享受隐式缓存，无需 extra_body。
+#   - "explicit"：额外传 cache_control，把 SYSTEM_PROMPT 显式标记为长期缓存。
+#   - "off"：调试/对比用，显式关闭（目前 SDK 层面即"不传 cache_control"，
+#            隐式缓存本身无法从客户端关闭，这里仅用于关闭显式缓存分支）。
+# ------------------------------------------------------------------
+PROMPT_CACHE_MODE = os.environ.get("PROMPT_CACHE_MODE", "implicit").strip().lower()
+PROMPT_CACHE_KEY = os.environ.get("PROMPT_CACHE_KEY", "business-trip-agent-system-prompt-v1")
+PROMPT_CACHE_TTL_SECONDS = int(os.environ.get("PROMPT_CACHE_TTL_SECONDS", "600"))
+
+
+# ------------------------------------------------------------------
+# 备用模型自动切换（对应 eval 报告 方案 5）
+#
+# 只处理"额度/配额耗尽"这一类特征明确的错误，不笼统捕获所有异常——真正的
+# 模型幻觉、网络抖动等问题应该照常暴露出来，不能被这里悄悄吞掉、伪装成
+# "切换模型解决了"。
+#
+# 切换粒度：只在两次"任务"之间切换，不在同一次 run_agent_loop 内部切换。
+# 一旦在某次调用里识别到额度错误，这一次任务直接判定为 infra_error 并结束，
+# 不在同一个上下文里换模型继续跑（避免同一次运行里推理风格不一致，破坏这次
+# 运行的可解释性）。真正的模型切换发生在下一次任务开始、读取
+# `_active_model["name"]` 的时候。
+# ------------------------------------------------------------------
+QWEN_BACKUP_MODEL = os.environ.get("QWEN_BACKUP_MODEL", "").strip() or None
+
+_active_model = {"name": QWEN_MODEL}
+
+_QUOTA_ERROR_KEYWORDS = (
+    "quota", "insufficient_quota", "insufficient quota",
+    "arrearage", "balance", "rate limit", "429",
+    "配额", "余额不足", "欠费", "额度",
+)
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(k.lower() in text for k in _QUOTA_ERROR_KEYWORDS)
+
+
+# ------------------------------------------------------------------
+# 超时错误识别（对应 eval 报告"慢请求看起来像卡死"问题的第二步）
+#
+# openai SDK 在请求超过 client 级别 timeout 时会抛 openai.APITimeoutError
+# （是 APIConnectionError 的子类）；网关/代理层如果在自己那一层掐断连接，
+# 也可能表现成别的异常类型但错误信息里带 "timeout"/"timed out" 字样，所以
+# 同时用 isinstance 和关键词兜底判断，尽量不漏判。
+#
+# 这不是"额度耗尽"，不应该触发切换备用模型的逻辑（备用模型解决不了网络慢
+# 的问题），只是网关这次响应慢/连接层面出问题——跟额度错误一样，属于
+# "不是 Agent 行为问题"，所以复用同一条 infra_error 路径上报，不计入
+# 确定性/语义评审统计，但不做模型切换。
+# ------------------------------------------------------------------
+_TIMEOUT_ERROR_KEYWORDS = ("timeout", "timed out", "read timeout", "connect timeout")
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, APITimeoutError):
+        return True
+    text = str(exc).lower()
+    return any(k in text for k in _TIMEOUT_ERROR_KEYWORDS)
+
+
+def _build_extra_body_for_cache() -> dict | None:
+    """按 PROMPT_CACHE_MODE 构造 extra_body，只在 explicit 模式下真正传参数。"""
+    if PROMPT_CACHE_MODE != "explicit":
+        return None
+    return {
+        "cache_control": {
+            "type": "ephemeral",
+            "cache_key": PROMPT_CACHE_KEY,
+            "cache_age": PROMPT_CACHE_TTL_SECONDS,
+        }
+    }
+
+
+# ------------------------------------------------------------------
+# 审批分类 / 报告核验 —— 与 harness.py 共用的纯函数
+#
+# 实现挪到了 approval_utils.py（见顶部 import），main.py 和 harness.py 都从
+# 那里导入同一份 classify_approval_purpose / find_fabricated_ids，避免两边
+# 各写一份、以后改一边忘了改另一边。这里不再重复定义。
+#
+# 用途提醒：
+# - classify_approval_purpose 用于运行时的安全护栏（见下方 tool_book_hotel）
+#   和 generate_final_report 里的报告核验依据；
+# - find_fabricated_ids 用于 generate_final_report 核验最终报告有没有编造
+#   不存在的订单号/确认号。
+#
+# 这不违反"失败之后怎么办永远由模型现场推理决定"的设计原则——这里划的是
+# "业务判断"和"安全护栏"两类不同的代码分支：前者（该选哪个酒店、失败了
+# 怎么重试）永远交给模型；后者（未经审批不能真的把超支的订单点下去）是绝对
+# 不能发生的安全底线，不该赌模型一定会听 prompt 的话。
+# ------------------------------------------------------------------
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -193,16 +374,37 @@ def tool_send_confirmation_email(to: str = "", summary: str = "") -> dict:
     }
 
 
-def _make_booking_tools() -> dict:
+def _make_booking_tools(approval_state: dict) -> dict:
     """
     每次任务开始时调用一次，返回一套只属于本次任务的 book_flight / book_hotel
-    工具函数。已预订记录（用于生成递增订单号）保存在闭包变量里，不写模块全局，
-    这样并发跑多个任务时彼此的预订状态不会互相污染。
+    工具函数。已预订记录保存在闭包变量里，不写模块全局，这样并发跑多个任务时
+    彼此的预订状态不会互相污染。
+
+    approval_state 是调用方（run_agent_loop）维护的、和 booked_flights/
+    booked_hotels 同级的会话状态（例如 {"hotel_over_budget_approved": bool}），
+    这里通过闭包捕获，用于 tool_book_hotel 内部的安全护栏检查（见下方）。
+
+    幂等性说明（对应 eval 报告问题 1 / 方案 1）：
+    已预订记录现在是 {id: 完整结果 dict} 而不是单纯的 list——不只是用来生成
+    递增订单号，还用于在重复调用时直接原样返回第一次的成功结果（同一个
+    order_id/confirmation_id），而不是重新走一遍下单逻辑。这样模型出于确认
+    心理重复调用一次（例如审批被拒后重新梳理方案，顺手再确认一次已完成项）
+    时不会被一个"陌生的失败"误导，也彻底堵住了"同一个 id 被计成两次成功预订"
+    的资损风险——两次调用返回的是完全相同的订单号，而不是两个不同的订单号。
     """
-    booked_flights: list[str] = []
-    booked_hotels: list[str] = []
+    booked_flights: dict[str, dict] = {}
+    booked_hotels: dict[str, dict] = {}
 
     def tool_book_flight(flight_id: str = "") -> dict:
+        if flight_id in booked_flights:
+            prev = dict(booked_flights[flight_id])
+            prev["duplicate_call"] = True
+            prev["message"] = (
+                f"航班 {flight_id} 此前已预订成功，订单号 {prev['order_id']}（本次为重复调用，"
+                f"未产生新订单，无需重复处理）"
+            )
+            return prev
+
         flights = MOCK_DATA["search_flight"]["flights"]
         flight = next((f for f in flights if f["flight_id"] == flight_id), None)
 
@@ -219,8 +421,7 @@ def _make_booking_tools() -> dict:
             }
 
         order_id = f"FLT-{1000 + len(booked_flights)}"
-        booked_flights.append(flight_id)
-        return {
+        result = {
             "status": "success",
             "flight_id": flight_id,
             "departure_time": flight["departure_time"],
@@ -229,17 +430,49 @@ def _make_booking_tools() -> dict:
             "order_id": order_id,
             "message": f"航班 {flight_id}（{flight['departure_time']} 出发）预订成功，订单号 {order_id}",
         }
+        booked_flights[flight_id] = result
+        return dict(result)
 
     def tool_book_hotel(hotel_id: str = "") -> dict:
+        if hotel_id in booked_hotels:
+            prev = dict(booked_hotels[hotel_id])
+            prev["duplicate_call"] = True
+            prev["message"] = (
+                f"{prev['hotel_name']} 此前已预订成功，确认号 {prev['confirmation_id']}"
+                "（本次为重复调用，未产生新订单，无需重复处理）"
+            )
+            return prev
+
         options = MOCK_DATA["search_hotel"]["options"]
         hotel = next((h for h in options if h["hotel_id"] == hotel_id), None)
 
         if hotel is None:
             return {"status": "not_found", "reason": f"未找到酒店 {hotel_id}"}
 
+        # ------------------------------------------------------------
+        # 安全护栏（代码层面的硬约束，不依赖模型是否听话）：
+        # 价格超出政策上限、且本次任务没有一次已批准的 hotel_over_budget
+        # 审批记录时，直接拒绝下单，而不是执行。这条检查原本只存在于
+        # harness.py 的事后评测（check_global_invariants）里，现在同时也
+        # 在生产运行时生效——评测那条不变量现在验证的是"运行时硬约束确实
+        # 生效了"，而不是"模型确实听话了"，两层防御分工更清楚。
+        #
+        # 这不是一个"该选哪个酒店"这类业务决策分支，而是"未经审批不能真的
+        # 把超支订单点下去"这条绝对底线，所以放在代码里、不赌模型会自觉
+        # 遵守 system prompt 的规则。
+        # ------------------------------------------------------------
+        policy_limit = MOCK_DATA["get_travel_policy"]["hotel_budget_per_night"]
+        if hotel["price_per_night"] > policy_limit and not approval_state.get("hotel_over_budget_approved"):
+            return {
+                "status": "rejected",
+                "reason": (
+                    f"酒店 {hotel_id} 价格 {hotel['price_per_night']} 超出政策上限 {policy_limit}，"
+                    "且未获得已批准的审批，已被系统拦截。请先调用 request_human_approval 获得批准后再重试。"
+                ),
+            }
+
         confirmation_id = f"HTL-{2000 + len(booked_hotels)}"
-        booked_hotels.append(hotel_id)
-        return {
+        result = {
             "status": "success",
             "hotel_id": hotel_id,
             "hotel_name": hotel["hotel_name"],
@@ -247,6 +480,8 @@ def _make_booking_tools() -> dict:
             "confirmation_id": confirmation_id,
             "message": f'{hotel["hotel_name"]} 预订成功，确认号 {confirmation_id}',
         }
+        booked_hotels[hotel_id] = result
+        return dict(result)
 
     return {
         "get_customer_info": tool_get_customer_info,
@@ -508,15 +743,48 @@ async def send(websocket: WebSocket, msg_type: str, **data):
     await websocket.send_text(json.dumps({"type": msg_type, **data}, ensure_ascii=False))
 
 
-def _call_with_tools(messages: list[dict]):
-    """同步阻塞的网络请求，扔到线程池里跑。"""
-    response = client.chat.completions.create(
-        model=QWEN_MODEL,
+def _call_with_tools(messages: list[dict], model: str | None = None):
+    """
+    同步阻塞的网络请求，扔到线程池里跑。
+
+    model 参数默认取当前"激活模型"（正常情况下等于 QWEN_MODEL；如果上一次
+    任务触发过额度耗尽且配置了备用模型，这里会自动变成 QWEN_BACKUP_MODEL，
+    见 _active_model / 方案 5）。
+
+    messages 里 system prompt 固定在最前面、本轮新增内容追加在最后，这个
+    结构本身就是隐式缓存需要的"稳定前缀"，不需要额外处理；PROMPT_CACHE_MODE
+    为 "explicit" 时才会额外传 cache_control（方案 4 长期）。
+    """
+    kwargs = dict(
+        model=model or _active_model["name"],
         messages=messages,
         tools=TOOLS,
         tool_choice="auto",
     )
-    return response.choices[0].message
+    extra_body = _build_extra_body_for_cache()
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+
+    response = client.chat.completions.create(**kwargs)
+
+    # 记录 usage（包含缓存命中情况），供前端/日志观测 token 消耗结构——
+    # 这不是必须的业务逻辑，只用于验证方案 4 是否生效，取不到就跳过。
+    usage_info = None
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        cached_tokens = None
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details is not None:
+            cached_tokens = getattr(details, "cached_tokens", None)
+        usage_info = {
+            "model": kwargs["model"],
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "cached_tokens": cached_tokens,
+        }
+
+    return response.choices[0].message, usage_info
 
 
 MAX_TURNS = 16  # 只统计"真正调用了模型"的轮次，不包含等待用户回复/等待审批的时间
@@ -604,7 +872,7 @@ async def generate_final_report(goal: str, checklist: dict, action_log: list[dic
 
     response = await asyncio.to_thread(
         client.chat.completions.create,
-        model=QWEN_MODEL,
+        model=_active_model["name"],
         messages=[{"role": "user", "content": prompt}],
     )
     raw_text = response.choices[0].message.content or ""
@@ -624,6 +892,30 @@ async def generate_final_report(goal: str, checklist: dict, action_log: list[dic
         # 模型没有按要求只输出 JSON，兜底：至少别把内容丢了，原样塞进决策层展示
         execution_layer = []
         decision_layer = [raw_text.strip()] if raw_text.strip() else ["⚠️ 报告生成格式异常，请查看后台日志。"]
+
+    # ------------------------------------------------------------------
+    # 报告核验（把 harness.py 里 check_final_report_groundedness 的核心逻辑
+    # 搬进生产路径）：execution_layer 理应"只写有客观依据的事实"，典型就是
+    # 订单号/确认号/event_id/message_id。这里从本次任务真实的 action_log 里
+    # 提取所有真实产生过的编号，跟 execution_layer 文本里提到的编号做差集，
+    # 凡是文本里提到、但从未真实出现过的编号，都视为报告编造了不存在的事实。
+    #
+    # 发现幻觉编号后不做"自动重新生成"这种更复杂的重试逻辑，而是直接在
+    # decision_layer 里标红降级展示——这符合项目一贯的"暴露问题而不是掩盖
+    # 问题"的风格（awaiting_reply / infra_error 都是这个思路）。
+    # ------------------------------------------------------------------
+    real_ids = {
+        item["result"].get(field)
+        for item in action_log
+        for field in ("order_id", "confirmation_id", "event_id", "message_id")
+        if item["result"].get(field)
+    }
+    fabricated = find_fabricated_ids(real_ids, "\n".join(execution_layer))
+    if fabricated:
+        decision_layer.append(
+            f"⚠️ 报告草稿中提到了未实际产生过的编号 {sorted(fabricated)}，"
+            "已自动标记，请人工复核（可能是模型幻觉）。"
+        )
 
     return {"execution_layer": execution_layer, "decision_layer": decision_layer}
 
@@ -667,9 +959,16 @@ async def run_agent_loop(
         )
         return
 
+    # approval_state：和 booked_flights/booked_hotels 同级的会话状态，记录
+    # "本次任务里是否已经有一次已批准的酒店超预算审批"，供 tool_book_hotel
+    # 内部的安全护栏读取。这里不做"用完就重置"：一次任务里只要批准过一次
+    # 超预算，后续同一任务内的重复下单尝试（幂等场景）也应该被认为已获授权，
+    # 不需要每次都重新走审批。
+    approval_state = {"hotel_over_budget_approved": False}
+
     # 每个任务拥有独立的工具函数（尤其是 book_flight / book_hotel 的预订记录），
     # 避免并发任务之间互相污染状态。
-    tool_functions = _make_booking_tools()
+    tool_functions = _make_booking_tools(approval_state)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -686,12 +985,94 @@ async def run_agent_loop(
     model_calls = 0
     while model_calls < MAX_TURNS:
         await send(websocket, "thinking")
-        try:
-            message = await asyncio.to_thread(_call_with_tools, messages)
-        except Exception as exc:  # noqa: BLE001
-            await send(websocket, "error", text=f"⚠️ 调用模型失败：{exc}")
+
+        # ---- 超时的业务层重试：只在 _is_timeout_error 为真时重试，配额
+        # 错误不重试、直接走下面的 infra_error+切模型逻辑。重试用尽后
+        # exc 会是最后一次失败的异常，落到下面同一套错误处理分支里，
+        # 依然正确降级为 infra_error，不会掩盖真正持续的超时问题。----
+        timeout_retries = 0
+        exc: Exception | None = None
+        message = usage_info = None
+        while True:
+            try:
+                message, usage_info = await asyncio.to_thread(_call_with_tools, messages)
+                exc = None
+                break
+            except Exception as call_exc:  # noqa: BLE001
+                exc = call_exc
+                if _is_timeout_error(exc) and timeout_retries < QWEN_TIMEOUT_MAX_RETRIES:
+                    timeout_retries += 1
+                    await send(
+                        websocket, "retrying",
+                        text=f"⚠️ 模型调用超时，正在进行第 {timeout_retries} 次业务层重试……",
+                        attempt=timeout_retries,
+                    )
+                    await asyncio.sleep(QWEN_TIMEOUT_RETRY_BACKOFF_SECONDS * timeout_retries)
+                    continue
+                break
+
+        if exc is not None:
+            if _is_quota_error(exc):
+                # 只吃"额度耗尽"这一类特征明确的错误；其他异常（真正的模型幻觉、
+                # 网络抖动等）照常原样报错，不会被这里悄悄吞掉。
+                previous_model = _active_model["name"]
+                if QWEN_BACKUP_MODEL and _active_model["name"] != QWEN_BACKUP_MODEL:
+                    # 主模型额度耗尽、且尚未切换过 —— 切到备用模型。
+                    # 切换粒度控制在"任务与任务之间"：这一次任务直接结束，标记为
+                    # infra_error；下一次任务开始时 _call_with_tools 会自动读取
+                    # 切换后的 _active_model，不在本次运行内部换模型继续跑。
+                    # 备用模型的额度不会自己恢复，所以这里是"一次性、永久"的切换，
+                    # 之后所有任务都会持续使用备用模型，这是预期行为。
+                    _active_model["name"] = QWEN_BACKUP_MODEL
+                    await send(
+                        websocket, "infra_error",
+                        text=(
+                            f"⚠️ 模型 {previous_model} 额度耗尽（{exc}），已自动切换到备用模型 "
+                            f"{QWEN_BACKUP_MODEL}。本次任务因基础设施问题中止，请重新发起任务，"
+                            f"新任务会使用备用模型继续执行。"
+                        ),
+                        model_used=previous_model,
+                        switched_to=QWEN_BACKUP_MODEL,
+                    )
+                else:
+                    # 已经在用备用模型（或压根没配置备用模型），额度问题依旧是
+                    # 基础设施问题，不是 Agent 行为问题——必须仍然标记为
+                    # infra_error，不能落到下面的 else 分支被当成普通 error，
+                    # 否则会被 harness 误计入确定性断言失败，污染报告。
+                    reason = (
+                        "备用模型额度也已耗尽，且没有更多可切换的模型"
+                        if QWEN_BACKUP_MODEL else "未配置备用模型（QWEN_BACKUP_MODEL）"
+                    )
+                    await send(
+                        websocket, "infra_error",
+                        text=(
+                            f"⚠️ 模型 {previous_model} 额度耗尽（{exc}），{reason}，"
+                            f"本次任务因基础设施问题中止。"
+                        ),
+                        model_used=previous_model,
+                        switched_to=None,
+                    )
+            elif _is_timeout_error(exc):
+                # 网关这次响应慢/连接层面出问题，不是 Agent 推理本身的问题，
+                # 也不是额度问题（所以不触发备用模型切换）。跟额度错误一样
+                # 走 infra_error：这次任务直接中止，前端能明确看到"这是基础
+                # 设施问题"而不是误以为死循环，也不会污染 harness 里的确定性/
+                # 语义统计。model_used 仍然是当前激活模型（没有发生切换）。
+                await send(
+                    websocket, "infra_error",
+                    text=(
+                        f"⚠️ 模型调用超时（{exc}），已重试 {timeout_retries} 次业务层重试仍未成功，"
+                        f"网关响应过慢或连接异常，本次任务因基础设施问题中止，请重新发起任务重试。"
+                    ),
+                    model_used=_active_model["name"],
+                    switched_to=None,
+                )
+            else:
+                await send(websocket, "error", text=f"⚠️ 调用模型失败：{exc}")
             return
         model_calls += 1
+        if usage_info:
+            await send(websocket, "usage", **usage_info)
 
         # 把模型这一轮的原始回复存回历史，下一轮请求要带上，否则模型没有记忆
         assistant_msg: dict = {"role": "assistant", "content": message.content or ""}
@@ -719,7 +1100,10 @@ async def run_agent_loop(
                     await send(websocket, "final_report", **report)
                 except Exception as exc:  # noqa: BLE001
                     await send(websocket, "error", text=f"⚠️ 生成最终报告失败：{exc}")
-                await send(websocket, "done")
+                # model_used：记录本次任务实际完成时使用的 Agent 侧模型，避免日后
+                # 回看某些 case 表现波动时，分不清是模型本身不稳定还是中途切换了
+                # 备用模型导致的（方案 5）。
+                await send(websocket, "done", model_used=_active_model["name"])
                 return
             else:
                 # 情况 b：Checklist 还没满，模型是在用文字等用户回复（比如刚被拒绝
@@ -754,6 +1138,10 @@ async def run_agent_loop(
 
                 if approved:
                     result = {"status": "approved", "message": f"用户已批准：{proposed_action}"}
+                    if classify_approval_purpose(reason, proposed_action) == "hotel_over_budget":
+                        # 记录到会话状态，供 tool_book_hotel 的安全护栏读取。
+                        # 不做"用完即重置"，理由见 approval_state 初始化处的注释。
+                        approval_state["hotel_over_budget_approved"] = True
                 else:
                     base_msg = (
                         "用户拒绝了该请求，请重新考虑其他合规方案，不要无视拒绝结果继续执行原计划。"
