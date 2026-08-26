@@ -1,6 +1,6 @@
 # Product & System Design — Business Trip Execution Agent
 
-> 面向对象说明：本文档面向评估 AI PM 候选人技术判断力的 Leader / 面试官撰写，目的是呈现一次产品级 Agent 设计的完整决策链条，而不是逐行代码注释。工程实现细节收在第 6 章「System Architecture」作为附录，供希望深挖的读者阅读；不希望陷入实现细节的读者可以跳过第 6 章直接看第 7 章 Evolution。评测体系的完整设计见姊妹文档 [`EVAL_DESIGN.md`](./eval/EVAL_DESIGN.md)。
+> 本文是给招聘 Leader 的可选深挖材料，不承担项目总览职责。项目做出了什么，先看 [`README.md`](./README.md)；本文只解释关键设计为什么这样做、放弃了什么、以及设计如何在真实问题中演进。评测方法独立收在 [`eval/EVAL_DESIGN.md`](./eval/EVAL_DESIGN.md)。
 
 ---
 
@@ -8,23 +8,26 @@
 
 这个项目要回答一个具体问题：给一句话目标——「下周二安排去上海拜访客户，把事情办妥」——一个 AI Agent 能不能在真实存在不确定性（航班可能订不上、酒店可能全部超预算、审批可能被拒绝）的前提下，自主完成一次商务差旅协调，并且值得被人信任？
 
-这个项目论证并实现了五种能力：
+这个项目围绕“可信执行”实现了七组相互连接的能力：
 
 1. **自主规划与动态重规划**——下一步做什么，由模型现场读取工具返回的原始结果推理决定，代码里不存在任何「如果航班满员就……」这样的业务分支。
 2. **可验证的任务完成判定**——任务是否完成由一份显式 Checklist 决定，而不是「流程跑完就算完成」这种隐式判断。
 3. **人机协作的审批控制**——超预算、面向客户的不可逆动作之前，Agent 会主动暂停、说明理由，等待人工批准。
 4. **可持久化 / 可断点恢复的执行**——暂停不是「进程还活着、卡在等待」，而是真正落盘；哪怕服务器重启、换一条连接，任务依然能续上。
 5. **面向生产的安全护栏**——超预算下单的拦截、报告编号防幻觉核验，这些安全底线写死在代码里，不依赖模型「自觉」遵守 prompt。
+6. **可治理的 Skill 与 Policy**——工具的输入输出、权限、风险和失败语义由统一 contract 管理；模型看到的政策原文与 runtime 执行的规则来自同一数据源。
+7. **稳定的 Integration Boundary**——Agent 面向稳定 Skill，adapter 隔离 mock、MCP 和 provider 差异，真实系统接入不改变模型侧契约。
 
 需要坦诚说明一点：这不是一个基于用户访谈立项的产品，而是一次主动发起的技术探索——我用产品判断的标准（场景选择、能力边界划分、风险定义、迭代方法论）去自我约束这次探索，而不是先有需求文档再有实现。文档接下来的内容，就是这条自我约束具体是怎么做的。
 
 ### 如果只有五分钟
 
-这份文档最想证明的不是「这个 Agent 有哪些功能」，而是三个产品判断：
+这份文档最想证明的不是「这个 Agent 有哪些功能」，而是四个产品判断：
 
 1. **什么时候该让模型自己决定，什么时候不该** —— 见第 2 章、第 3.5 节
 2. **四个具体的取舍是怎么做的、放弃了什么** —— 见第 4 章
 3. **有一次判断出过错，是怎么发现、怎么归因、怎么修的** —— 见第 7 章 Evolution 1，一次最初被误判为「模型犯错」、后来定位为系统状态机设计缺陷的真实案例
+4. **怎样让工具、权限、政策与真实 connector 可治理，而不是继续堆在主循环里** —— 见第 3.6–3.7 节、第 4.5–4.6 节
 
 第 5、6 章分别是交互设计说明和工程实现附录。感兴趣可以细读，跳过也不影响理解前面的判断。
 
@@ -110,6 +113,32 @@ Agent 自己判断「这个场景需不需要审批」并主动调用一个和�
 - **效率软警告**：同一个只读查询工具被完全相同参数重复调用时，系统会广播一条警告事件，暴露「这里可能在浪费」这个信号，但不阻止执行——是否要因此调整由使用者判断。
 - **报告防幻觉核验**：任务结束时的分层报告生成后，代码会核对报告里提到的订单号/确认号是否在本次任务里真实产生过，一旦发现编造的编号会明确标红，而不是悄悄相信模型没有幻觉；报告结构本身还会过一次 Schema 校验，字段缺失或类型不对也会被精确捕获。
 
+### 3.6 Skill Contract、角色与 Policy Governance
+
+当工具只有两三个时，handler、function-calling Schema 和权限规则分开维护似乎没有问题；当能力扩展到 13 个 Skill，这种做法会迅速产生漂移：模型看到的接口可能已经过期，runtime 执行的是另一套参数，评测还在按第三套假设做断言。
+
+因此项目把每个 Skill 收敛成一份统一 contract：输入与成功态输出 JSON Schema、允许角色、是否有副作用、风险等级、失败后应如何处理、版本与替代关系。Runtime 的 tools Schema、权限检查、Eval contract check 和自动生成的 Skill Registry 都从这里派生。
+
+静态 Skill 权限和动态审批权限被刻意保持正交：前者回答“这个角色原则上能否调用该能力”，后者回答“这一次具体动作触发政策后，谁有权放行”。例如 employee 可以调用 `book_hotel`，但不能自行批准超预算预订。
+
+政策本身也从 prompt 和 mock 裸数字中抽离为结构化数据。`rule_text` 给人和模型阅读，`rule_logic` 给 runtime 执行，两者共享 `policy_id`、版本和生效日期。预算检查、审批角色、拒绝原因和审计记录由同一 Policy Store 提供，避免“模型读到的规则”和“代码真正执行的规则”成为两套事实。
+
+### 3.7 Integration Boundary：稳定能力，替换 Provider
+
+真实系统接入没有直接写进 Agent loop，而是放在 Skill 之后的 adapter 层。模型始终调用 `get_my_calendar`，底层可以是确定性的 mock，也可以是只读 MCP server；更换来源不会改变模型面对的业务接口。
+
+adapter 还承担一项容易被低估的产品职责：把 provider error 翻译成 Agent 可以采取行动的业务语义。超时变成 `temporarily_unavailable`，权限问题变成 `permission_denied`，关键字段缺失变成 `data_missing`；尤其是数据缺失不能被静默解释为“全天有空”。这比把异常文本原样抛给模型更稳定，也比 connector 失败后返回空数组更安全。
+
+当前只接入测试账号的真实只读个人日历。选择 read-only 是有意控制 blast radius：先验证身份、协议、失败语义、可观测性和凭据边界，再考虑写日历、发邮件或真实预订。
+
+### 3.8 Governed Multi-Agent：协作不是权限扩散
+
+Trip Orchestrator 是唯一 user-facing owner；Booking Subagent 只比较候选并生成 typed proposal，Policy/Compliance Subagent 只复核 proposal。两个 specialist 都没有外部写入或审批权限。
+
+协作结果不是一段自然语言，而是带 `proposal_id`、candidate snapshot digest、Policy review 和 effective decision 的持久化 artifact。`book_flight` / `book_hotel` 在副作用前验证 proposal 是否匹配、是否 stale、是否有同版本 review，以及所需 approval 是否绑定同一 proposal。Policy agent 和 deterministic runtime 冲突时取更严格结果，因此模型可以否决，却不能放宽政策。
+
+这选择了 agents-as-tools，而不是 handoff：specialist 不需要接管用户会话，Orchestrator 必须继续拥有 Checklist、HITL、恢复入口和最终综合。完整协议与冲突矩阵见 [`docs/MULTI_AGENT_DESIGN.md`](./docs/MULTI_AGENT_DESIGN.md)。
+
 ---
 
 ## 4. Key Product Decisions & Trade-offs
@@ -165,6 +194,46 @@ Agent 自己判断「这个场景需不需要审批」并主动调用一个和�
 
 **Trade-off**：SDK 的 `Session` 解决的是「下一次调用怎么自动带上历史」，本质是消息日志的持久化协议，不感知「审批还没处理完」「这一批工具调用只执行了一半」这类业务语义上的中间态。这个项目的暂停点天然带有这种中间态，如果只持久化消息列表，恢复时没法知道「上次到底停在哪一步、还有什么没做完」。选择自己实现，代价是要多维护一层持久化 Schema；换来的是暂停语义更接近工作流引擎里的 durable execution，而不只是一份对话记忆。
 
+### 4.5 Contract 与 Policy 同源，而非靠文档同步
+
+**背景**：工具说明、JSON Schema、权限、政策文案和运行时判断如果分别维护，短期迭代很快，长期一定漂移。
+
+**决策**：Skill contract 成为能力接口的 source of truth；结构化 Policy Store 成为规则和审批依据的 source of truth。文档和权限矩阵尽量由代码生成。
+
+**被放弃的备选**：继续在 `main.py`、prompt、mock 数据和 Markdown 表格里分别维护相同信息。
+
+**Trade-off**：统一 contract 增加了前期建模成本，失败态目前仍采用公共 status 约定加自然语言语义，而没有为所有 provider error 建立完整 Schema。这个选择避免过度设计，同时把最容易造成事故的输入、成功输出、权限和政策阈值先收拢起来。
+
+### 4.6 真实接入先只读，再扩大副作用
+
+**背景**：一个差旅 Agent 最有说服力的演进似乎是尽快接入真实预订和邮件，但这也会同时引入付款、客户触达、凭据保存、撤销和审计问题。
+
+**决策**：第一条真实 integration 选择个人日历只读，并通过 adapter + MCP 接入；Demo 和 Eval 默认仍使用 mock。
+
+**被放弃的备选**：直接把某一家日历 SDK 写进 runtime，或为了展示“真实”而同时接入写操作。
+
+**Trade-off**：当前不能宣称已经完成端到端真实差旅执行；换来的是可以单独验证 connector contract、身份权限、failure normalization、trace 和凭据隔离，而不扩大外部副作用。这是先把边界做对，再扩大能力范围的顺序选择。
+
+### 4.7 Long-term Memory 与 Session persistence 分层
+
+**背景**：Session persistence 回答“同一个任务如何恢复”，Long-term Memory 回答“新任务应该从过去召回什么”。把完整历史任务直接拼进新 Session，不仅成本不可控，也容易造成跨客户泄漏和历史指令越权。
+
+**决策**：使用独立 SQLite `MemoryStore` 保存 entity-scoped 的结构化软偏好。第一阶段只写用户明确表达的偏好；actor scope 在 Session 创建时召回，customer scope 必须等 CRM 返回稳定 ID 后召回，route scope 使用规范化的 `origin->destination`。注入记录携带 source、confidence 与更新时间，并明确低于当前任务指令、审批、Policy 和 Permission。
+
+**被放弃的备选**：从一次预订结果推断偏好；先上 vector database；把 Memory 文本拼入原 system prompt；让 guardrail 读取 Memory 决定是否放行。
+
+**Trade-off**：确定性 explicit extractor 会漏掉一些自然语言表达，但不会轻易把偶然行为固化为偏好。实体过滤和排序不具备 semantic search 的召回能力，却能在当前数据量下提供更可解释的 scope isolation。Memory 写入是独立 post-run hook，失败只记录事件，不反向污染已完成任务。
+
+### 4.8 复用现有 Harness，而非迁移到 Multi-Agent Framework
+
+**背景**：OpenAI Agents SDK 已经提供 `Agent.as_tool()`、handoff、guardrails、HITL、tracing 和 Sandbox Agents。直接迁移能减少部分 runtime 代码。
+
+**决策**：吸收 agents-as-tools、typed handoff input、tool guardrail、durable RunState 和 tracing span 的设计思想，在现有 runtime 上新增 delegation protocol；不为了 multi-agent 重写已有 Session、Policy、approval 和 Eval 基础设施。
+
+**被放弃的备选**：把整个项目迁移到 SDK；用 handoff 让 Booking 或 Policy agent 接管对话；把多个 specialist 输出直接串成 prompt。
+
+**Trade-off**：要自己维护 nested usage、trace event 和 proposal lifecycle，但能直接比较同一 harness 上 single-agent 与 governed multi-agent 的差异。Sandbox Agents 当前也不接入：它解决 filesystem/shell workspace 隔离，不等于资金动作、身份和审批的 transaction sandbox。
+
 ---
 
 ## 5. User Experience & Interaction Design
@@ -206,9 +275,23 @@ Agent 自己判断「这个场景需不需要审批」并主动调用一个和�
 
 恢复不是「继续往下跑」，而是一次新的函数调用，带着一个显式描述「人做了什么」的 `resume_input`。
 
-### 6.3 Tool 接口设计
+### 6.3 Skill、Policy 与 Connector 分层
 
-工具接口本身就是 Verifier 的一部分——接口设计得越贴近真实业务语义，模型现场推理的空间才越真实。核心原则是 **Search / Book 分离**：Search 只负责返回完整候选列表，Book 只接受候选中真实存在的 ID，两者职责严格分离，模型必须先比较候选、再做预订，不能凭空猜一个条件去「试」。这条原则本身也是一次迭代的产物（详见第 7 章 Evolution 2）。
+工具接口本身就是 Verifier 的一部分——接口设计得越贴近真实业务语义，模型现场推理的空间才越真实。核心原则是 **Search / Book 分离**：Search 返回完整候选列表，Book 只接受候选中真实存在的 ID，模型必须先比较候选、再做预订，不能凭空猜一个条件去“试”。
+
+完整调用边界分成四层：
+
+```text
+Model-facing Skill contract
+        ↓
+角色权限与 Policy guardrail
+        ↓
+Runtime handler
+        ↓
+Mock 或 provider adapter / MCP
+```
+
+Skill 回答“这个能力是什么”，Policy 回答“这次调用在什么条件下允许”，adapter 回答“底层系统怎样完成它”。三者分离后，可以替换 provider 而不改模型接口，也可以更新政策而不改 handler 里的硬编码阈值。
 
 ### 6.4 术语对照表（面向熟悉 LangGraph / OpenAI Agents SDK 的读者）
 
@@ -220,6 +303,8 @@ Agent 自己判断「这个场景需不需要审批」并主动调用一个和�
 | `run_agent_loop` | SDK 里的一次 "Run"（内部是 LLM 调用↔工具执行的循环） |
 | `AgentDefinition` | 对应 SDK 的 `Agent`（指令+工具的静态能力定义） |
 | 硬拦截、重复只读调用效率警告 | 概念上呼应 SDK 的 `Guardrails`，但实现方式是工具函数内部前置校验，不是独立注册组件 |
+| `Skill` contract | Model-facing tool contract + permission/risk metadata |
+| `calendar_adapter` + MCP server | Connector / integration boundary，provider 细节不进入 Agent loop |
 
 ---
 
@@ -267,11 +352,29 @@ Agent 自己判断「这个场景需不需要审批」并主动调用一个和�
 
 **取舍**：直接代价是「状态必须可以被序列化」这条约束被前所未有地当真了。评测框架也需要一个新的外层驱动循环，去模拟「反复调用、反复读盘、反复决定下一次输入」这套新的调用协议。这是「要不要为一个 demo 级项目支付生产级架构成本」这个问题上，把答案定为「要」的一次具体体现。
 
+### Evolution 5 — 从裸工具和裸政策到可治理 Contract
+
+**发现**：工具实现、Schema 和权限靠函数名字符串关联；政策上限同时存在于 mock、prompt 和 guardrail 参数中。能力增加后，任何一处修改都可能让模型接口、实际执行和 Eval 假设不一致。
+
+**根因**：这些信息虽然描述的是同一个能力或同一条政策，却没有 source of truth。
+
+**修正**：建立统一 Skill contract，补齐输入与成功输出 Schema、角色、副作用、风险和失败语义；把政策文本和可执行规则放进带版本的 Policy Store，并让 runtime、审批记录和文档生成共同读取。
+
+**取舍**：这不是给 Demo 增加一个可见功能，而是在支付“以后不会靠人工记忆保持一致”的基础设施成本。它的价值主要体现在能力扩展、权限审计、回归测试和真实系统接入时。
+
+### Evolution 6 — 从 Single-Agent 到有治理边界的 Multi-Agent
+
+**发现**：仅把任务拆给多个 agent，会引入新的失败面：上下文过度共享、候选 ID 幻觉、Policy agent 放宽规则、审批跨方案复用，以及 handoff 后责任 owner 不清。
+
+**修正**：Trip Orchestrator 保持 owner；specialist 使用最小 context projection 和 Pydantic output；proposal/review 进入 durable Session；runtime 对 candidate、freshness、Policy verdict、approval role 与 proposal scope 做 deterministic 校验。
+
+**取舍**：每次成功差旅增加了 specialist model calls 和 latency，但协作本身变成了可追踪、可 replay、可做 binary eval 的协议。是否值得这笔 token 成本，不靠架构审美判断，而应通过后续 A/B eval 比较任务成功率、治理失败率和每次成功任务成本。
+
 ---
 
 ## 8. Evaluation Strategy（Summary）
 
-如果一个 Agent 系统没有配套的评测体系，「它好不好」就只能靠观感判断。这个项目把评测拆成三层——确定性断言（结构化事实）、全局不变量（贯穿所有场景的硬规则）、LLM-as-judge（只在真正需要语义判断的地方使用）——并且专门设计了「如何让 mock 数据真正把模型推到决策边界上，而不是构造一个看起来吓人、实际有安全出口的场景」这套方法论。完整的评测体系设计、风险分类、失败归因、以及「如何定义一个 AI 产品的质量」这个更根本的问题，见姊妹文档 [`EVAL_DESIGN.md`](./eval/EVAL_DESIGN.md)。
+如果一个 Agent 系统没有配套的评测体系，「它好不好」就只能靠观感判断。这个项目把评测拆成三层——确定性断言（结构化事实）、全局不变量（贯穿所有场景的硬规则）、LLM-as-judge（只在真正需要语义判断的地方使用）——并且专门设计了「如何让 mock 数据真正把模型推到决策边界上，而不是构造一个看起来吓人、实际有安全出口的场景」这套方法论。当前有 12 个 case、默认 26 次运行，并包含 Skill contract、角色权限、Session continuation、Prompt Injection 和 Multi-Agent Governance 等回归路径。完整设计见 [`eval/EVAL_DESIGN.md`](./eval/EVAL_DESIGN.md)。
 
 ---
 
@@ -281,8 +384,8 @@ Agent 自己判断「这个场景需不需要审批」并主动调用一个和�
 
 | 空白 | 现状 |
 |---|---|
-| 跨任务的长期记忆 | 当前每次任务都是全新上下文，是否需要引入跨任务记忆（如「上次那次拜访的酒店偏好」）尚未定案，这跟单任务的持久化是两个不同层面的问题 |
+| Memory 的 inferred 偏好与 semantic retrieval | MVP 已支持 explicit actor/customer/route Memory、纠正、遗忘和两阶段召回；inferred + TTL 与 vector/semantic retrieval 尚未启用，需先通过跨客户泄漏与覆盖关系 Eval |
 | 多实例部署下的持久化层 | 目前是单文件 SQLite，适合单开发者演示；多 worker 并发写入需要换成 Postgres / Redis 之类，对外接口已刻意保持和具体存储实现无关 |
 | 恢复操作缺少鉴权 | 任何拿到任务 ID 的人都可以对一个等待审批的任务发起响应，演示场景下没问题，生产环境需要补上身份校验 |
-| 真实系统接入 | 日历同步、邮件发送目前均为 mock，是最适合优先替换为真实 API 的两个环节，因为它们的结果客观可核，替换后不影响失败点的可控性 |
+| 真实系统接入 | `get_my_calendar` 已具备在显式 `CALENDAR_PROVIDER=mcp` 下读取测试账号真实日历的接入能力；业务 Skill 契约不变，adapter 负责归一化超时、权限拒绝和数据缺失。日历写入、邮件与机酒预订仍为 mock/sandbox，避免阶段性扩大不可逆动作范围。 |
 | 成本/延迟指标的产品化呈现 | Token 用量、耗时等数据已在采集，但还没有聚合成一份「这个 Agent 平均一次任务成本多少、审批环节平均让用户多等了多久」的产品级视图——这类指标对判断一个 Agent 能不能真正上线，比 Checklist 完成率更关键，是这个项目目前最值得补的一块 |

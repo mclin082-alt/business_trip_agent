@@ -1,21 +1,24 @@
 # AI Product Quality & Evaluation Framework — Business Trip Execution Agent
 
-> 面向对象说明：本文档是 [`DESIGN.md`](./DESIGN.md) 的姊妹文档，回答「我们怎么定义这个 Agent 做得好不好，以及怎么系统性地发现它做得不好的地方」。对应代码：`harness.py` / `approval_utils.py` / `session_store.py`。第 7 章是给希望深挖实现细节的读者准备的技术附录。
+> 本文是给招聘 Leader 的可选深挖材料，回答“如何定义这个 Agent 做得好不好，以及如何系统性发现它做得不好的地方”。项目总览见 [`../README.md`](../README.md)，产品与系统设计见 [`../DESIGN.md`](../DESIGN.md)。对应实现是 `eval/harness.py`、`eval/replay_harness.py`、`approval_utils.py` 和独立 contract tests。
 
 ---
 
 ## 0. Executive Summary
 
-一个能跑的 Agent demo 和一个「可以被信任上线」的 Agent 之间，中间隔着一整套评测体系。这份文档记录了这套体系的设计判断：怎么定义「好」的具体维度、怎么设计测试场景才能真正把模型推到决策边界上而不是自欺欺人、出了问题怎么归因到底是模型判断错了还是系统本身有缺陷、以及这一切怎么形成一个持续迭代的闭环。这套方法论本身，就是 AI 产品经理最核心的一块能力——「定义 AI 产品质量」不是一句口号，而是一系列具体、可执行、可复用的判断标准。
+一个能跑的 Agent demo 和一个“可以被信任执行”的 Agent 之间，隔着一整套评测体系。当前 Harness 定义了 8 个产品质量维度、12 个 case，覆盖 L1 Planning 到 L9 Multi-Agent Governance，默认共运行 26 次。每条轨迹同时接受 deterministic check、global invariants 和必要时的 LLM-as-judge，并保存为可离线 replay 的 JSONL 事件流。
 
-### 如果只有十分钟
+这份文档的重点不是数字本身，而是三项方法：先定义质量，再写 case；强迫场景真正经过目标风险；失败后区分模型判断、runtime 缺陷和测试设置错误。
 
-这份文档最想证明的不是「我们做了哪些测试」，而是两个方法论判断：
+### 如果只有 5 分钟
+
+这份文档最想证明的不是“跑了多少测试”，而是三个方法论判断：
 
 1. **怎么设计场景，才能真正把模型推到决策边界上，而不是造一个看起来吓人、实际有安全出口的假测试** —— 见第 4 章
 2. **「未复现」和「没测到」是两种完全不同的结论，怎么区分才不会互相污染** —— 见第 6 章
+3. **为什么硬事实交给 deterministic checks，只有语义判断才使用 LLM-as-judge** —— 见第 3 章
 
-第 5 章的 Failure Taxonomy、第 7 章的 case matrix 技术附录，感兴趣可以细读，跳过也不影响理解前两点。
+第 5 章的 Failure Taxonomy、第 7 章的 case matrix 是技术附录，感兴趣可以细读，跳过也不影响理解前面的核心判断。
 
 ---
 
@@ -34,7 +37,7 @@
 
 ## 2. Product Quality Dimensions
 
-在写任何一个具体测试 case 之前，先要回答一个更根本的问题：**「好」这件事到底有哪些维度？** 这个项目定义了七个维度：
+在写任何一个具体测试 case 之前，先要回答一个更根本的问题：**「好」这件事到底有哪些维度？** 这个项目定义了八个维度：
 
 | 维度 | 要回答的问题 | 当前状态 |
 |---|---|---|
@@ -45,8 +48,9 @@
 | Efficiency | 是否存在浪费——重复查询、无意义重试 | ✅ |
 | Continuity | 需要用户补充信息时，上下文是否完整保留 | ✅ |
 | Robustness | 面对对抗性输入（如工具返回结果里混入的伪造指令）是否会被带偏 | ✅ |
+| Collaboration | delegation、role assignment、conflict resolution 与 escalation 是否遵守协议 | ✅ |
 
-七个维度目前均有对应的测试场景覆盖（完整的场景清单见第 7 章附录）。定义这七个维度本身就是一次产品判断：选择「Recovery」和「Continuity」分开定义，是因为「失败后能不能恢复」和「信息不足时上下文会不会丢」是两类完全不同的失败模式，混在一起会让归因变得模糊——这个区分直接决定了第 5 章 Failure Taxonomy 里标签的粒度该怎么划。
+八个维度目前均有对应的测试场景覆盖（完整的场景清单见第 7 章附录）。Collaboration 被单独定义，是因为一个任务最终完成，不代表 agent-agent 协作可信：proposal 过期、Policy verdict 被绕过或 approval 跨 proposal 复用，都可能在 happy path 下被结果掩盖。
 
 ---
 
@@ -55,10 +59,21 @@
 每一次测试运行，都会对同一份执行轨迹做三层互相独立的检查：
 
 1. **确定性断言（Deterministic Check）**——针对每个测试场景专属的结构化事实，比如「checklist 是否全部完成」「审批之后是否真的按批准结果执行了」。
-2. **全局不变量（Global Invariants）**——与具体场景无关、对所有测试都必须成立的硬规则，比如「预订不能被重复计费」「超预算的酒店在没有已批准审批的情况下不能预订成功」「报告里的编号不能是编造的」。这一层的意义在于：哪怕某个具体场景的测试通过了，只要触碰了这些红线，整体依然判定失败。
+2. **全局不变量（Global Invariants）**——与具体场景无关、对所有测试都必须成立的硬规则，比如「预订不能被重复计费」「超预算的酒店在没有已批准审批的情况下不能预订成功」「成功预订必须有同一 proposal 的 Booking delegation 与非 DENY Policy review」「报告里的编号不能是编造的」。这一层的意义在于：哪怕某个具体场景的测试通过了，只要触碰了这些红线，整体依然判定失败。
 3. **LLM-as-judge（语义评判）**——只在真正需要语义理解、规则无法表达的地方使用，比如「模型的推理文字里是否真的比较过候选方案」。裁判模型和被测模型是分离的，避免同一个模型自己给自己判分；返回三态结果（通过/不通过/无法判断），「无法判断」不计入失败——这是一个容易被忽略但很关键的细节，很多团队会把「证据不足」错误地记成「不通过」。
 
 评测环境和生产环境使用完全隔离的持久化路径，每次评测运行前会清空重建，避免历史数据污染下一次结果——这是「测试环境和生产环境边界」这个基本工程原则在这个项目里的具体体现。
+
+有两类检查被刻意放在完整 Agent run 之外：
+
+- **Contract checks**：`tool_abstraction_contract`、`intern_permission_denied` 和 `multi_agent_governance_contract` 不调用模型，直接验证 Skill Schema、权限、delegation conflict 与 approval scope。这类确定性能力不需要支付 LLM 随机性和成本。
+- **Integration checks**：`tests/test_calendar_adapter.py` 验证 mock/MCP 边界与 failure normalization；`eval/mcp_smoke_test.py` 只验证测试账号的真实只读连通性。它们不混入默认 Eval，避免外部网络或授权状态污染 Agent 行为基线。
+
+### 3.1 事件流与 Offline Replay
+
+每次运行都会把 reasoning、tool call、Observation、审批、Checklist、warning 和最终报告保存为 JSONL。`replay_harness.py` 可以重新读取历史轨迹、运行确定性检查和归因，而不再次调用被测 Agent。
+
+这带来两个直接价值：一是修改检查逻辑后可以重评历史结果；二是能把“模型这次做了什么”和“我们后来如何判它”分开，避免为了调 Eval 反复消耗模型调用，也避免新采样掩盖原始 bad case。
 
 ---
 
@@ -109,13 +124,34 @@ checklist_ungrounded    checklist 标完成但找不到对应的成功依据
 
 这里有一个值得强调的方法论判断：**「未复现」也是合法结论。** 针对某类风险设计诱导性场景，跑 2-3 轮观察，如果多轮定向测试下依然没有复现，如实记录「未复现」——这本身就是一条真实、有价值的测试结论，说明当前版本在该类风险上是稳健的，不需要靠「编造出模型确实犯过这个错」来证明方案的严谨性。
 
-一旦某类问题被真实发现并修复，对应的测试场景会被标记为 **regression case**，长期保留在测试集里防止已修复的问题回归。一个具体的例子：效率护栏最初只存在于评测脚本里，属于「只有跑评测才会发现」的问题；后来被下沉到生产运行时同样生效（详见 DESIGN.md 第 7 章 Evolution 3）——这是评测发现的问题反过来推动产品能力升级的一个具体例子，说明评测体系不是一个自说自话的旁路系统，而是真正在影响产品设计决策。
+一旦某类问题被真实发现并修复，对应的测试场景会被标记为 **regression case**，长期保留在测试集里防止已修复的问题回归。一个具体的例子：效率护栏最初只存在于评测脚本里，属于“只有跑评测才会发现”的问题；后来被下沉到生产 runtime 同样生效（详见 [`../DESIGN.md`](../DESIGN.md) 第 7 章 Evolution 3）。这说明 Eval 不是旁路报告，而是在反向改变产品和系统设计。
 
 ---
 
 ## 7. Capability Coverage & Case Matrix（Technical Appendix）
 
-### 7.1 A-G 类别对照表
+### 7.1 当前 Case Matrix
+
+Harness 当前包含 12 个 case。`runs` 是默认采样次数，总计 26 次；其中三个 contract case 不调用 LLM。
+
+| Capability | Case | Runs | 主要验证内容 |
+|---|---|---:|---|
+| L1 Planning | `happy_path` | 3 | 完成目标，并在多个酒店候选中进行合理比较 |
+| L2 Tool Selection | `tool_abstraction_contract` | 1 | Search/Book 接口、Skill 输入输出 contract 不回归 |
+| L3 Observation Understanding | `recover_after_flight_booking_failure` | 1 | 首选航班预订失败后理解 Observation 并改选；`must_exercise` |
+| L4 Policy Compliance | `choose_policy_compliant_hotel` | 3 | 存在合规候选时不无故选择超预算方案 |
+| L5 Human Approval | `approval_required_all_hotels_over_budget` | 3 | 所有候选超预算时必须触发审批 |
+| L5 Human Approval | `approval_required_before_email` | 3 | 面向客户发送前必须最终确认 |
+| L6 Session Continuation | `session_continuation_after_reject` | 2 | 审批拒绝后上下文不丢失，能继续推进 |
+| L6 Session Continuation | `session_continuation_after_reject_with_note` | 2 | 拒绝附带新约束后，后续决策真正使用该约束 |
+| L7 Skill Permissions | `intern_permission_denied` | 1 | intern 的副作用调用被拒绝、只读 Skill 放行 |
+| L8 Robustness | `bounded_behavior_when_all_flights_fail` | 3 | 全部方案失败时有界退出，不死循环 |
+| L8 Robustness | `prompt_injection_via_tool_result` | 3 | 工具结果中的伪系统指令不能绕过审批 |
+| L9 Multi-Agent Governance | `multi_agent_governance_contract` | 1 | Policy 不能放宽 runtime、审批不可跨 proposal 复用、冲突必须显式 |
+
+这张表描述的是当前代码事实；运行报告还会从 `CASES.capability` metadata 自动生成实际通过率和覆盖列表。
+
+### 7.2 A-G 质量类别对照表
 
 | 类别 | 指标 | 覆盖情况 | 落地方式 |
 |---|---|---|---|
@@ -136,16 +172,19 @@ checklist_ungrounded    checklist 标完成但找不到对应的成功依据
 | G. Robustness | Prompt Injection | ✅ | 工具返回结果里混入伪造系统指令的对抗性场景 |
 | | Long Context 退化 | ⚠️ 部分 | 测了轮数上限边界，未单独测「上下文变长后指令遵循是否退化」 |
 | | Ambiguous Goal | ❌ 未做 | 成本高，明确列为暂不做 |
+| H. Collaboration | Delegation Integrity | ✅ | proposal/review ID、freshness、candidate membership |
+| | Conflict Resolution | ✅ | model/runtime 取更严格 verdict，缺失审批路径 fail closed |
+| | Role Assignment | ✅ | specialist 无副作用权限；审批角色与 proposal scope 分离 |
 
-### 7.2 Reliability 层：确保测试结果本身可信
+### 7.3 Reliability 层：确保测试结果本身可信
 
 评测结果要可信，测试基础设施本身也需要被验证。工具调用和它对应的结果，靠唯一 ID 关联配对，而不是假设事件按顺序一一对应——一旦出现乱序或并行调用，基于顺序的配对会直接错位。
 
 这里有一处专门记录下来的坑：审批工具永远不会产生标准的「调用结果」事件，它走的是「请求/裁决」这条单独的事件对。如果不特殊处理，所有依赖「配对结果」的检查，会在审批流程明明跑对了的情况下也假性失败。这类踩过的坑被沉淀成配对逻辑里的显式处理，而不是留作隐患。
 
-### 7.3 Capability 覆盖表（数据驱动，非手写文档）
+### 7.4 Capability 覆盖表（数据驱动，非手写文档）
 
-每个测试场景标注了一个 Capability 字段（L1 Planning ~ L8 Robustness），覆盖率报告直接从这个字段自动生成——改一次测试场景定义就同步更新覆盖率表，不会出现「文档和代码脱节」的情况。这个设计判断的意义是：能力覆盖率不应该是一份需要手动维护、容易过时的 Excel，而应该是代码运行的直接产物。
+每个测试场景标注了一个 Capability 字段（L1 Planning ~ L9 Multi-Agent Governance），覆盖率报告直接从这个字段自动生成——改一次测试场景定义就同步更新覆盖率表，不会出现「文档和代码脱节」的情况。这个设计判断的意义是：能力覆盖率不应该是一份需要手动维护、容易过时的 Excel，而应该是代码运行的直接产物。
 
 ---
 
@@ -154,8 +193,8 @@ checklist_ungrounded    checklist 标完成但找不到对应的成功依据
 | 空白 | 原因 |
 |---|---|
 | Partial Success 报告怎么写 | checklist 是二元判断，暂不细分部分完成场景 |
-| Tool Precision（多余工具调用） | 优先级低于已覆盖的六类风险 |
-| Token/Cost 聚合报表 | 数据已采集，只是还没聚合成产品级视图——这是目前最值得补的一块，见 DESIGN.md 第 9 章 |
+| Tool Precision（多余工具调用） | 优先级低于当前已覆盖的核心失败模式 |
+| Token/Cost 聚合报表 | 数据已采集，只是还没聚合成产品级视图——这是目前最值得补的一块，见 [`../DESIGN.md`](../DESIGN.md) 第 9 章 |
 | Long Context 退化专项测试 | 部分覆盖（轮数上限边界），未单独测「上下文变长后指令遵循是否退化」 |
 | Ambiguous Goal | 需要新的检查逻辑和目标变体，成本高，明确标注暂不做 |
 | 恢复流程本身的正确性（「读回的状态是否完整」） | 由独立的序列化往返单测覆盖，评测框架只验证「恢复之后行为是否正确」，两者是不同层次的测试，不重复覆盖 |

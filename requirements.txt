@@ -3,3 +3,4 @@ uvicorn[standard]
 websockets
 openai
 python-dotenv
+mcp

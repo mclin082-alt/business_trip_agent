@@ -9,6 +9,8 @@ to ensure consistent behavior.
 import json
 import re
 
+import policy_store
+
 
 def classify_approval_purpose(reason: str, proposed_action: str) -> str:
     """Classify approval purpose into 'confirmation_email', 'hotel_over_budget', or 'unknown'.
@@ -134,3 +136,59 @@ def classify_failure_tag(reason_text: str) -> str:
         if any(k in text for k in keywords):
             return tag
     return "other"
+
+
+# ------------------------------------------------------------------
+# Policy-referenced variants (P2 阶段新增): 判断依据从裸数字变成"引用了哪条
+# 政策"，供运行时的 rejected 消息和最终报告引用。不改动上面任何已有函数的
+# 签名/行为，harness.py 里现有调用不受影响。
+# ------------------------------------------------------------------
+def check_policy_boundary_with_ref(price: float, topic: str) -> tuple[bool, dict | None]:
+    """跟 check_policy_boundary 语义一致（True = 未超预算），但额外带回
+    "依据的是哪条政策"这个引用，供运行时的 rejected 消息和最终报告引用。
+
+    topic 例如 "hotel_budget" / "flight_budget"，对应 policy_store 里的 topic 字段。
+    """
+    limit, policy_id = policy_store.get_rule_limit(topic)
+    ref = policy_store.get_policy_ref(topic)
+    if limit is None:
+        # 政策库里找不到这条规则：保守起见视为"未超限"，避免因为政策库本身
+        # 缺条目就误伤正常预订；但这种情况本身应该被当作一类需要关注的问题。
+        return True, None
+    return price <= limit, ref
+
+
+def check_hotel_approval_with_ref(approval_state: dict) -> tuple[bool, dict | None]:
+    """跟 check_hotel_approval 语义一致，额外带回批准时记录下来的政策引用
+    （如果 approval_state 里存了的话，见 main.py 的改动）。
+    """
+    approved = bool(approval_state.get("hotel_over_budget_approved"))
+    ref = approval_state.get("hotel_over_budget_policy_ref")
+    return approved, ref
+
+
+def approver_roles_for_purpose(purpose: str) -> tuple[str, ...]:
+    """审批用途（classify_approval_purpose 的返回值）-> 允许审批的角色列表。
+    'hotel_over_budget' -> policy_store 里 hotel_over_budget_approval 政策的 approver_roles
+    'confirmation_email' -> confirmation_email_approval 政策的 approver_roles
+    'unknown' -> 空元组（不知道该由谁批，调用方应该按最保守策略处理）
+    """
+    topic_map = {
+        "hotel_over_budget": "hotel_over_budget_approval",
+        "confirmation_email": "confirmation_email_approval",
+    }
+    topic = topic_map.get(purpose)
+    if topic is None:
+        return ()
+    return policy_store.get_approver_roles(topic)
+
+
+def is_valid_approver(purpose: str, approver_role: str) -> bool:
+    """校验"谁批的"是否真的有权批这一类事项，用于审批记录的可审计校验。
+    没有 purpose 对应的政策（unknown）时保守放行，不阻断主流程——
+    分类失败本身应该在别处被记录为一类问题，而不是在这里静默拦截审批。
+    """
+    allowed = approver_roles_for_purpose(purpose)
+    if not allowed:
+        return True
+    return approver_role in allowed

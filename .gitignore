@@ -6,3 +6,5 @@ __pycache__/
 eval_logs/
 eval result/
 Agent_Evaluation_Framework_Design.docx
+sessions.db
+memories.db

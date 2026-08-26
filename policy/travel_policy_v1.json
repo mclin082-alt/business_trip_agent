@@ -1,0 +1,63 @@
+{
+  "policy_set_version": "2026.1",
+  "policies": [
+    {
+      "policy_id": "POL-TRAVEL-2026-001",
+      "version": "v1.2",
+      "effective_date": "2026-01-01",
+      "topic": "hotel_budget",
+      "title": "酒店预算上限",
+      "applies_to": ["employee", "manager", "travel_admin"],
+      "rule_text": "酒店单间每晚不超过 800 元人民币；超出该上限的预订需先经审批人批准后方可预订。",
+      "rule_logic": {
+        "type": "max_amount",
+        "field": "hotel_price_per_night",
+        "limit": 800,
+        "currency": "CNY"
+      }
+    },
+    {
+      "policy_id": "POL-TRAVEL-2026-002",
+      "version": "v1.2",
+      "effective_date": "2026-01-01",
+      "topic": "flight_budget",
+      "title": "机票预算上限",
+      "applies_to": ["employee", "manager", "travel_admin"],
+      "rule_text": "单程机票价格不超过 2000 元人民币，超出部分需在预订前与直属主管确认必要性。",
+      "rule_logic": {
+        "type": "max_amount",
+        "field": "flight_price",
+        "limit": 2000,
+        "currency": "CNY"
+      }
+    },
+    {
+      "policy_id": "POL-TRAVEL-2026-003",
+      "version": "v1.2",
+      "effective_date": "2026-01-01",
+      "topic": "hotel_over_budget_approval",
+      "title": "酒店超预算审批规则",
+      "applies_to": ["employee", "manager", "travel_admin"],
+      "rule_text": "酒店预订价格超出 POL-TRAVEL-2026-001 规定的每晚预算上限时，必须由 manager 或 travel_admin 角色审批通过后，Agent 才能执行预订；employee 角色不能自行批准。",
+      "rule_logic": {
+        "type": "approval_required",
+        "trigger_policy_id": "POL-TRAVEL-2026-001",
+        "approver_roles": ["manager", "travel_admin"]
+      }
+    },
+    {
+      "policy_id": "POL-TRAVEL-2026-004",
+      "version": "v1.0",
+      "effective_date": "2026-01-01",
+      "topic": "confirmation_email_approval",
+      "title": "客户确认邮件最终发送审批",
+      "applies_to": ["employee", "manager", "travel_admin"],
+      "rule_text": "向客户发送行程确认邮件前，无论是否涉及超预算，都必须先经过一次人工最终确认，因为这是面向客户的外部、不可逆动作。employee 及以上角色均可执行该确认。",
+      "rule_logic": {
+        "type": "approval_required",
+        "trigger_policy_id": null,
+        "approver_roles": ["employee", "manager", "travel_admin"]
+      }
+    }
+  ]
+}

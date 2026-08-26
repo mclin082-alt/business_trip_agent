@@ -11,23 +11,48 @@ from session_store and re-entering run_agent_loop with an explicit
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import os
+import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
 from approval_utils import (
-    check_hotel_approval,
-    check_policy_boundary,
+    check_hotel_approval_with_ref,
+    check_policy_boundary_with_ref,
     classify_approval_purpose,
     find_fabricated_ids,
+    is_valid_approver,
     is_repeated_readonly_call,
 )
+import policy_store
 import session_store
+import memory_store
+from multi_agent import (
+    BOOKING_AGENT,
+    DELEGATION_TOOL_AGENTS,
+    ORCHESTRATOR_AGENT,
+    POLICY_AGENT,
+    booking_agent_messages,
+    check_booking_execution,
+    create_booking_proposal,
+    create_policy_review,
+    current_search_sequence,
+    policy_agent_messages,
+)
+from context_manager import build_model_context, estimate_context_tokens, get_context_strategy
+from integrations.calendar_adapter import get_my_calendar as get_calendar_from_adapter
+from skills import (
+    DEFAULT_ROLE,
+    SKILL_BY_NAME,
+    build_tools_schema,
+    wrap_with_permission_check,
+)
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -118,9 +143,41 @@ class Session:
     # 1, but the multi_tool_call_detected defense path can still produce >1).
     pending_approval: dict | None = None
     pending_tool_calls: list = dataclasses.field(default_factory=list)
+    # Skill-level permission role (see skills.py). Defaults to the ordinary
+    # staff role so existing behavior/eval cases are unaffected; a caller
+    # can pass a different role (e.g. "intern") to exercise the
+    # permission_denied path against write/side-effect Skills.
+    role: str = DEFAULT_ROLE
+    # Non-sensitive connector context only. OAuth/access tokens must remain in
+    # the MCP server or its secret store, never in sessions.db.
+    actor_id: str = "demo_employee"
+    connector_context: dict = dataclasses.field(default_factory=dict)
+    # Bounded snapshots of soft preference data; guardrails never read them.
+    resolved_subjects: dict = dataclasses.field(default_factory=dict)
+    recalled_memories: list[dict] = dataclasses.field(default_factory=list)
+    memory_initialized_subjects: list[str] = dataclasses.field(default_factory=list)
+    # Governed multi-agent state. Specialists never own the user conversation
+    # or execute side effects; they emit typed proposals/reviews persisted here.
+    multi_agent_enabled: bool = True
+    subagent_model_calls: int = 0
+    delegation_records: list[dict] = dataclasses.field(default_factory=list)
+    booking_proposals: dict[str, dict] = dataclasses.field(default_factory=dict)
+    policy_reviews: dict[str, dict] = dataclasses.field(default_factory=dict)
+    # Increment when the persisted Session shape needs a migration.
+    schema_version: int = session_store.CURRENT_SESSION_SCHEMA_VERSION
 
     @classmethod
-    def new(cls, goal: str, system_prompt: str) -> "Session":
+    def new(
+        cls,
+        goal: str,
+        system_prompt: str,
+        role: str = DEFAULT_ROLE,
+        actor_id: str = "demo_employee",
+        resolved_subjects: dict | None = None,
+        multi_agent_enabled: bool | None = None,
+    ) -> "Session":
+        subjects = dict(resolved_subjects or {})
+        subjects["actor"] = actor_id
         return cls(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -138,6 +195,16 @@ class Session:
             goal=goal,
             pending_approval=None,
             pending_tool_calls=[],
+            role=role,
+            actor_id=actor_id,
+            connector_context={"calendar_provider": os.environ.get("CALENDAR_PROVIDER", "mock")},
+            resolved_subjects=subjects,
+            multi_agent_enabled=(
+                os.environ.get("MULTI_AGENT_ENABLED", "1").strip().lower()
+                not in {"0", "false", "off", "no"}
+                if multi_agent_enabled is None
+                else multi_agent_enabled
+            ),
         )
 
 
@@ -155,8 +222,13 @@ class AgentDefinition:
 # Mock data
 # ---------------------------------------------------------------------------
 MOCK_DATA = {
+    # NOTE: hotel/flight budget policy no longer lives here — it's sourced
+    # from policy_store.py / policy/travel_policy_v1.json (single source of
+    # truth shared by runtime enforcement and eval invariant checks).
     "get_customer_info": {
         "status": "success",
+        "customer_id": "customer_bluebay_tech",
+        "company_id": "company_bluebay_tech",
         "company": "上海蓝湾科技有限公司",
         "address": "上海市浦东新区陆家嘴环路 1088 号",
         "contact": {"name": "王明", "title": "技术总监", "phone": "138-0000-1234"},
@@ -179,12 +251,6 @@ MOCK_DATA = {
         ],
         "free_slots": ["09:00-10:00", "11:30-18:00"],
     },
-    "get_travel_policy": {
-        "status": "success",
-        "flight_budget": 2000,
-        "hotel_budget_per_night": 800,
-        "notes": "酒店单间每晚不超过 800 元，超出需提前审批。",
-    },
     "search_flight": {
         "status": "success",
         "flights": [
@@ -206,6 +272,38 @@ MOCK_DATA = {
 }
 
 
+def _usage_payload(response, model: str) -> dict:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"model": model}
+    cached_tokens = None
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        cached_tokens = getattr(details, "cached_tokens", None)
+    return {
+        "model": model,
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+        "cached_tokens": cached_tokens,
+    }
+
+
+def _call_specialist(messages: list[dict]) -> tuple[str, dict]:
+    """Run one bounded specialist turn without exposing side-effect tools."""
+    model = _active_model["name"]
+    response = client.chat.completions.create(model=model, messages=messages)
+    return response.choices[0].message.content or "", _usage_payload(response, model)
+
+
+def _latest_successful_result(action_log: list[dict], name: str) -> dict | None:
+    for item in reversed(action_log):
+        result = item.get("result") or {}
+        if item.get("name") == name and result.get("status") == "success":
+            return result
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -213,14 +311,31 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
     def tool_get_customer_info(company: str = "") -> dict:
         return dict(MOCK_DATA["get_customer_info"])
 
-    def tool_get_my_calendar(date: str = "") -> dict:
-        return dict(MOCK_DATA["get_my_calendar"])
+    async def tool_get_my_calendar(date: str = "") -> dict:
+        return await get_calendar_from_adapter(
+            date=date,
+            actor_id=session.actor_id,
+            mock_result=MOCK_DATA["get_my_calendar"],
+        )
 
     def tool_get_customer_calendar(date: str = "") -> dict:
         return dict(MOCK_DATA["get_customer_calendar"])
 
     def tool_get_travel_policy() -> dict:
-        return dict(MOCK_DATA["get_travel_policy"])
+        flight_limit, _ = policy_store.get_rule_limit("flight_budget")
+        hotel_limit, _ = policy_store.get_rule_limit("hotel_budget")
+        flight_ref = policy_store.get_policy_ref("flight_budget")
+        hotel_ref = policy_store.get_policy_ref("hotel_budget")
+        return {
+            "status": "success",
+            "flight_budget": flight_limit,
+            "hotel_budget_per_night": hotel_limit,
+            "notes": hotel_ref["rule_text"] if hotel_ref else "",
+            "policy_refs": {
+                "flight_budget": flight_ref,
+                "hotel_budget": hotel_ref,
+            },
+        }
 
     def tool_search_flight(date: str = "", destination: str = "") -> dict:
         # NOTE: a flight may carry an internal-only "actual_status" field used to
@@ -238,13 +353,147 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
     def tool_search_hotel(date: str = "", near: str = "") -> dict:
         return dict(MOCK_DATA["search_hotel"])
 
+    async def tool_delegate_booking_plan(
+        booking_type: str = "",
+        objective: str = "",
+        constraints: str = "",
+    ) -> dict:
+        search_name = {
+            "flight": "search_flight",
+            "hotel": "search_hotel",
+        }.get(booking_type)
+        if search_name is None:
+            return {
+                "status": "invalid_request",
+                "reason": "booking_type 必须是 flight 或 hotel。",
+            }
+        search_result = _latest_successful_result(session.action_log, search_name)
+        if search_result is None:
+            return {
+                "status": "missing_context",
+                "reason": f"请先调用 {search_name} 获取候选，再委派 Booking Subagent 比较。",
+            }
+        candidates = search_result.get("flights" if booking_type == "flight" else "options", [])
+        if not candidates:
+            return {"status": "no_candidates", "reason": f"{search_name} 没有返回可比较候选。"}
+
+        delegation_id = f"DLG-{uuid.uuid4().hex[:10]}"
+        proposal_id = f"PRP-{uuid.uuid4().hex[:10]}"
+        record = {
+            "delegation_id": delegation_id,
+            "from_agent": ORCHESTRATOR_AGENT,
+            "to_agent": BOOKING_AGENT,
+            "objective": objective or f"比较并推荐 {booking_type} 候选",
+            "allowed_capabilities": ["compare_candidates"],
+            "status": "running",
+        }
+        session.delegation_records.append(record)
+        supporting_context = {
+            name: result
+            for name in (
+                "get_customer_info",
+                "get_my_calendar",
+                "get_customer_calendar",
+                "get_travel_policy",
+            )
+            if (result := _latest_successful_result(session.action_log, name)) is not None
+        }
+        messages = booking_agent_messages(
+            goal=session.goal,
+            booking_type=booking_type,
+            candidates=candidates,
+            objective=objective,
+            constraints=constraints,
+            supporting_context=supporting_context,
+        )
+        try:
+            session.subagent_model_calls += 1
+            raw_output, usage = await asyncio.to_thread(_call_specialist, messages)
+            proposal = create_booking_proposal(
+                raw_output=raw_output,
+                booking_type=booking_type,
+                candidates=candidates,
+                objective=objective,
+                constraints=constraints,
+                delegation_id=delegation_id,
+                proposal_id=proposal_id,
+                source_search_seq=current_search_sequence(session.action_log, booking_type),
+                model_usage=usage,
+            )
+        except Exception as exc:  # noqa: BLE001
+            record.update({"status": "failed", "error": str(exc)})
+            return {
+                "status": "delegation_failed",
+                "delegation_id": delegation_id,
+                "agent": BOOKING_AGENT,
+                "reason": str(exc),
+            }
+
+        session.booking_proposals[proposal_id] = proposal
+        record.update({
+            "status": "completed",
+            "output_ref": proposal_id,
+            "context_digest": proposal["context_digest"],
+            "model_usage": usage,
+        })
+        return dict(proposal)
+
+    async def tool_delegate_policy_review(proposal_id: str = "") -> dict:
+        proposal = session.booking_proposals.get(proposal_id)
+        if proposal is None:
+            return {
+                "status": "not_found",
+                "reason": f"找不到 Booking proposal {proposal_id}。",
+            }
+        delegation_id = f"DLG-{uuid.uuid4().hex[:10]}"
+        review_id = f"REV-{uuid.uuid4().hex[:10]}"
+        record = {
+            "delegation_id": delegation_id,
+            "from_agent": ORCHESTRATOR_AGENT,
+            "to_agent": POLICY_AGENT,
+            "objective": f"复核 Booking proposal {proposal_id}",
+            "allowed_capabilities": ["read_policy", "issue_verdict"],
+            "status": "running",
+        }
+        session.delegation_records.append(record)
+        try:
+            session.subagent_model_calls += 1
+            raw_output, usage = await asyncio.to_thread(
+                _call_specialist, policy_agent_messages(proposal=proposal)
+            )
+            review = create_policy_review(
+                raw_output=raw_output,
+                proposal=proposal,
+                delegation_id=delegation_id,
+                review_id=review_id,
+                model_usage=usage,
+            )
+        except Exception as exc:  # noqa: BLE001
+            record.update({"status": "failed", "error": str(exc)})
+            return {
+                "status": "delegation_failed",
+                "delegation_id": delegation_id,
+                "agent": POLICY_AGENT,
+                "reason": str(exc),
+            }
+
+        session.policy_reviews[proposal_id] = review
+        record.update({
+            "status": "completed",
+            "output_ref": review_id,
+            "proposal_id": proposal_id,
+            "effective_decision": review["effective_decision"],
+            "model_usage": usage,
+        })
+        return dict(review)
+
     def tool_sync_calendar(event_title: str = "", date: str = "", time: str = "") -> dict:
         return dict(MOCK_DATA["sync_calendar"])
 
     def tool_send_confirmation_email(to: str = "", summary: str = "") -> dict:
         return dict(MOCK_DATA["send_confirmation_email"])
 
-    def tool_book_flight(flight_id: str = "") -> dict:
+    def tool_book_flight(flight_id: str = "", proposal_id: str = "") -> dict:
         if flight_id in session.booked_flights:
             prev = dict(session.booked_flights[flight_id])
             prev["duplicate_call"] = True
@@ -259,6 +508,20 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
 
         if flight is None:
             return {"status": "not_found", "reason": f"未找到航班 {flight_id}"}
+
+        gate = None
+        if session.multi_agent_enabled:
+            gate = check_booking_execution(
+                booking_type="flight",
+                option_id=flight_id,
+                proposal_id=proposal_id,
+                booking_proposals=session.booking_proposals,
+                policy_reviews=session.policy_reviews,
+                action_log=session.action_log,
+                approval_state=session.approval_state,
+            )
+            if not gate["allowed"]:
+                return {key: value for key, value in gate.items() if key != "allowed"}
 
         # "actual_status" (if present) represents the real inventory state at
         # booking submission time, which can differ from what search returned
@@ -282,10 +545,15 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
             "order_id": order_id,
             "message": f"航班 {flight_id}（{flight['departure_time']} 出发）预订成功，订单号 {order_id}",
         }
+        if gate:
+            result.update({
+                "proposal_id": gate["proposal_id"],
+                "policy_review_id": gate["review_id"],
+            })
         session.booked_flights[flight_id] = result
         return dict(result)
 
-    def tool_book_hotel(hotel_id: str = "") -> dict:
+    def tool_book_hotel(hotel_id: str = "", proposal_id: str = "") -> dict:
         if hotel_id in session.booked_hotels:
             prev = dict(session.booked_hotels[hotel_id])
             prev["duplicate_call"] = True
@@ -301,15 +569,34 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
         if hotel is None:
             return {"status": "not_found", "reason": f"未找到酒店 {hotel_id}"}
 
-        # Hard guardrail: block over-budget bookings without prior approval
-        policy_limit = MOCK_DATA["get_travel_policy"]["hotel_budget_per_night"]
-        within_policy = check_policy_boundary(hotel["price_per_night"], policy_limit)
-        has_hotel_approval = check_hotel_approval(session.approval_state)
+        gate = None
+        if session.multi_agent_enabled:
+            gate = check_booking_execution(
+                booking_type="hotel",
+                option_id=hotel_id,
+                proposal_id=proposal_id,
+                booking_proposals=session.booking_proposals,
+                policy_reviews=session.policy_reviews,
+                action_log=session.action_log,
+                approval_state=session.approval_state,
+            )
+            if not gate["allowed"]:
+                return {key: value for key, value in gate.items() if key != "allowed"}
+
+        # Hard guardrail: block over-budget bookings without prior approval.
+        # 判断阈值和拒绝消息里的引用都来自 policy_store，跟 get_travel_policy
+        # 工具返回给模型看的文本是同一份数据源，不会出现"文档一套/代码一套"。
+        within_policy, policy_ref = check_policy_boundary_with_ref(
+            hotel["price_per_night"], "hotel_budget"
+        )
+        has_hotel_approval, approval_ref = check_hotel_approval_with_ref(session.approval_state)
         if not within_policy and not has_hotel_approval:
+            ref_text = f"（依据 {policy_ref['policy_id']} / {policy_ref['version']}）" if policy_ref else ""
             return {
                 "status": "rejected",
+                "policy_id": policy_ref["policy_id"] if policy_ref else None,
                 "reason": (
-                    f"酒店 {hotel_id} 价格 {hotel['price_per_night']} 超出政策上限 {policy_limit}，"
+                    f"酒店 {hotel_id} 价格 {hotel['price_per_night']} 超出政策上限{ref_text}，"
                     "且未获得已批准的审批，已被系统拦截。请先调用 request_human_approval 获得批准后再重试。"
                 ),
             }
@@ -323,6 +610,11 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
             "confirmation_id": confirmation_id,
             "message": f'{hotel["hotel_name"]} 预订成功，确认号 {confirmation_id}',
         }
+        if gate:
+            result.update({
+                "proposal_id": gate["proposal_id"],
+                "policy_review_id": gate["review_id"],
+            })
         session.booked_hotels[hotel_id] = result
         return dict(result)
 
@@ -333,6 +625,8 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
         "get_travel_policy": tool_get_travel_policy,
         "search_flight": tool_search_flight,
         "search_hotel": tool_search_hotel,
+        "delegate_booking_plan": tool_delegate_booking_plan,
+        "delegate_policy_review": tool_delegate_policy_review,
         "book_flight": tool_book_flight,
         "book_hotel": tool_book_hotel,
         "sync_calendar": tool_sync_calendar,
@@ -340,190 +634,21 @@ def _make_booking_tools(session: Session) -> dict[str, Any]:
     }
 
 
-# Tool JSON Schema definitions (OpenAI function calling format)
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_customer_info",
-            "description": "查询客户的 CRM 档案，包括公司名称、地址、联系人信息。用于确定拜访目的地。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "company": {"type": "string", "description": "客户公司名称，如果还不知道可以留空"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_my_calendar",
-            "description": "查询我自己在指定日期的日程安排，确认自己是否有空。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "要查询的日期，例如 '下周二'"},
-                },
-                "required": ["date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_customer_calendar",
-            "description": "查询客户在指定日期的日程安排，了解客户什么时间方便见面。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "要查询的日期，例如 '下周二'"},
-                },
-                "required": ["date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_travel_policy",
-            "description": "查询公司差旅政策，包括机票和酒店的预算上限，用于判断后续方案是否合规。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_flight",
-            "description": (
-                "搜索指定日期前往目的地的可选航班，返回完整候选列表（航班编号、出发/到达时间、"
-                "价格、查询时的余票状态）。该工具只负责提供候选信息，不会替你选择或预订航班。"
-                "你需要结合客户会面时间、出行安排和差旅预算自行比较后，再调用 book_flight。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "出发日期，例如 '下周二'"},
-                    "destination": {"type": "string", "description": "到达城市，例如 '上海'"},
-                },
-                "required": ["date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_hotel",
-            "description": (
-                "查询客户公司附近的酒店候选列表，每个候选都带 hotel_id、价格和 within_policy"
-                "（是否在差旅政策预算内）。预订时必须使用候选中真实存在的 hotel_id。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {"type": "string", "description": "入住日期，例如 '下周二'"},
-                    "near": {"type": "string", "description": "希望靠近的地点，例如客户公司地址或所在商圈"},
-                },
-                "required": ["date", "near"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "book_flight",
-            "description": (
-                "预订 search_flight 返回的某个具体航班，必须传入搜索结果中真实存在的 flight_id。"
-                "搜索结果只代表查询时的状态，提交订单时仍可能因实时库存变化而预订失败——遇到失败后，"
-                "应根据返回原因从之前的候选中重新选择，或重新搜索，不要放弃。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "flight_id": {"type": "string", "description": "要预订的航班编号，例如 'MU5101'"},
-                },
-                "required": ["flight_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "book_hotel",
-            "description": (
-                "预订某个具体酒店，必须传入 search_hotel 返回的候选中真实存在的 hotel_id。"
-                "如果该酒店超出差旅政策的每晚预算上限（候选中 within_policy 为 false），必须先调用"
-                " request_human_approval 获得批准之后才能调用这个工具，不能自己直接下单。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "hotel_id": {"type": "string", "description": "要预订的酒店编号，例如 'HTL-C'"},
-                },
-                "required": ["hotel_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sync_calendar",
-            "description": "把这次拜访的行程同步为一条日历事件，方便双方以及自己后续查看。应该在航班和酒店都确认之后调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "event_title": {"type": "string", "description": "日历事件标题，例如 '上海客户拜访'"},
-                    "date": {"type": "string", "description": "日期"},
-                    "time": {"type": "string", "description": "会面时间"},
-                },
-                "required": ["event_title", "date", "time"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_confirmation_email",
-            "description": "向客户发送本次拜访的确认邮件/通知。这是面向客户的外部动作，应该在行程全部确认（航班、酒店、会面时间）之后，并且已经通过 request_human_approval 获得最终发送确认之后，作为最后一步调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "to": {"type": "string", "description": "收件人，例如客户联系人姓名或邮箱"},
-                    "summary": {"type": "string", "description": "本次拜访行程的简要总结，会写进邮件正文"},
-                },
-                "required": ["to", "summary"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "request_human_approval",
-            "description": (
-                "在需要人工审批的场景下调用此工具，暂停当前流程，向用户展示理由和你打算"
-                "执行的动作，等待用户点击'批准'或'拒绝'后再继续。以下两种情况必须调用它："
-                "① 打算预订的酒店价格超出差旅政策的每晚预算上限；"
-                "② 正式向客户发送确认邮件之前的最终确认（无论前面是否超预算都需要走这一步，"
-                "因为这是面向客户的外部、不可逆动作）。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "为什么需要人工审批，用自然语言说明当前情况"},
-                    "proposed_action": {"type": "string", "description": "如果获得批准，你打算执行的具体动作"},
-                },
-                "required": ["reason", "proposed_action"],
-            },
-        },
-    },
-]
+# Tool JSON Schema definitions (OpenAI function calling format).
+#
+# NOTE: this used to be a hand-maintained list here, kept in sync with
+# _make_booking_tools() purely by matching function names by string. It is
+# now derived from skills.py's Skill registry, which is the single source
+# of truth for schema + permissions + failure semantics. See skills.py.
+TOOLS = build_tools_schema()
 
 
 SYSTEM_PROMPT = """你是一个商务拜访执行 Agent，负责帮用户把一次出差安排办妥。
 
-你可以使用的工具覆盖了完成这件事所需要的全部环节：查客户信息（CRM）、查双方日历、
-查差旅政策、搜索/预订航班、搜索/预订酒店、同步日历、发送确认邮件给客户。这些工具
-之间没有预先写死的调用顺序，具体先查什么、后做什么，由你自己规划。
+你是唯一面向用户并对最终任务负责的 Trip Orchestrator。你可以查客户信息（CRM）、
+查双方日历、查差旅政策、搜索/预订航班、搜索/预订酒店、同步日历、发送确认邮件，
+也可以把有边界的子任务委派给 Booking Subagent 和 Policy/Compliance Subagent。
+工具之间没有预先写死的调用顺序，具体先查什么、后做什么，由你自己规划。
 
 规则：
 1. 工具返回的是原始信息，你需要自己判断这意味着什么、下一步该怎么办——不要假设
@@ -542,15 +667,23 @@ SYSTEM_PROMPT = """你是一个商务拜访执行 Agent，负责帮用户把一�
    如果没有附带说明、或者你没有足够信息独立决定该怎么调整，可以用文字向用户
    提问澄清，这一轮你可以不调用任何工具——系统会等待用户回复，不会因此把任务
    判定为已结束。
-5. 建议的大致顺序是：先了解客户信息和双方日程、查政策，再搜索并确认航班和酒店，
+5. 航班或酒店搜索返回候选后，必须调用 `delegate_booking_plan` 让 Booking Subagent
+   比较候选并生成 proposal；再用该 `proposal_id` 调用 `delegate_policy_review`。
+   Policy review 的 `effective_decision` 是治理边界：
+   - ALLOW：可以用候选 ID + proposal_id 调用对应 book 工具；
+   - REQUIRE_APPROVAL：必须先调用 request_human_approval，并把同一个 proposal_id
+     一并传入；批准后才能预订；
+   - DENY：不能执行，应调整约束、重新搜索或重新 delegation。
+   你不能自己充当 Booking 或 Policy agent，也不能用旧 proposal 预订新搜索结果。
+6. 建议的大致顺序是：先了解客户信息和双方日程、查政策，再搜索并确认航班和酒店，
    最后把行程同步到日历、发确认邮件给客户——但如果你判断有更合理的顺序，可以自行
    调整，这不是硬性规定。
-6. 当你确认任务已经全部完成（航班、酒店都已预订，日历已同步，确认邮件已发送），
+7. 当你确认任务已经全部完成（航班、酒店都已预订，日历已同步，确认邮件已发送），
    请输出一段总结文字说明做了什么、结果如何，并且这一轮**不要再调用任何工具**——
    不调用工具、且所有事项都已办妥，才代表任务真正结束。如果任务还没办妥而你这一
    轮没有调用工具（比如你在等用户回答一个问题），系统会把它当作"等待用户回复"，
    而不是任务结束，你之后依然可以正常调用工具继续推进。
-7. 航班安排需要遵循"先搜索候选、比较约束、再预订"的流程：不要凭空猜测航班时间，
+8. 航班安排需要遵循"先搜索候选、委派比较与合规复核、再预订"的流程：不要凭空猜测航班时间，
    必须使用 search_flight 返回的真实 flight_id 调用 book_flight。预订失败不代表
    任务失败，从之前的候选中重新选择，或重新搜索，都是合理的下一步。
 """
@@ -636,7 +769,10 @@ def _call_with_tools(messages: list[dict], model: str | None = None):
     return response.choices[0].message, usage_info
 
 
-MAX_TURNS = 16
+# Governed delegation adds four manager turns on the normal path (two
+# proposals + two reviews). Keep a bounded ceiling while leaving recovery
+# room for one failed booking/re-delegation cycle.
+MAX_TURNS = 24
 
 CHECKLIST_LABELS = {
     "flight": "航班已确认",
@@ -692,6 +828,10 @@ def _format_approval_records(approval_records: list[dict]) -> str:
     for r in approval_records:
         outcome = "已批准" if r["approved"] else "被拒绝"
         line = f"- 理由：{r['reason']}；拟执行动作：{r['proposed_action']}；结果：{outcome}"
+        if r.get("policy_id"):
+            line += f"；依据政策：{r['policy_id']}（{r.get('policy_version', '')}）"
+        if r.get("approver_role"):
+            line += f"；审批角色：{r['approver_role']}"
         if r.get("user_note"):
             line += f"；用户补充说明：{r['user_note']}"
         lines.append(line)
@@ -780,15 +920,39 @@ async def _resolve_pending_approval(
     call_id = pending["call_id"]
     reason = pending["reason"]
     proposed_action = pending["proposed_action"]
-    approved = bool(resume_input.get("approved"))
+    proposal_id = pending.get("proposal_id", "")
+    requested_approved = bool(resume_input.get("approved"))
     user_note = (resume_input.get("user_note") or "").strip()
+    purpose = classify_approval_purpose(reason, proposed_action)
+    approver_role = resume_input.get("approver_role") or (
+        "manager" if purpose == "hotel_over_budget" else session.role
+    )
+    resolution_error = ""
+    if requested_approved and not is_valid_approver(purpose, approver_role):
+        resolution_error = (
+            f"角色 {approver_role!r} 无权批准 purpose={purpose}，审批按拒绝处理。"
+        )
+    if (
+        requested_approved
+        and purpose == "hotel_over_budget"
+        and session.multi_agent_enabled
+        and not proposal_id
+    ):
+        resolution_error = "酒店超预算审批缺少 proposal_id，不能形成可审计授权。"
+    approved = requested_approved and not resolution_error
 
     if approved:
         result = {"status": "approved", "message": f"用户已批准：{proposed_action}"}
-        if classify_approval_purpose(reason, proposed_action) == "hotel_over_budget":
+        if purpose == "hotel_over_budget":
             session.approval_state["hotel_over_budget_approved"] = True
+            session.approval_state["hotel_over_budget_approved_proposal_id"] = proposal_id
+            session.approval_state["hotel_over_budget_policy_ref"] = policy_store.get_policy_ref(
+                "hotel_budget"
+            )
     else:
-        base_msg = "用户拒绝了该请求，请重新考虑其他合规方案，不要无视拒绝结果继续执行原计划。"
+        base_msg = resolution_error or (
+            "用户拒绝了该请求，请重新考虑其他合规方案，不要无视拒绝结果继续执行原计划。"
+        )
         if user_note:
             base_msg += f" 用户补充说明：{user_note}"
         else:
@@ -798,11 +962,22 @@ async def _resolve_pending_approval(
             )
         result = {"status": "rejected", "message": base_msg}
 
+    approval_topic_ref = {
+        "hotel_over_budget": policy_store.get_policy_ref("hotel_over_budget_approval"),
+        "confirmation_email": policy_store.get_policy_ref("confirmation_email_approval"),
+    }.get(purpose)
     session.approval_records.append({
         "reason": reason,
         "proposed_action": proposed_action,
         "approved": approved,
+        "requested_approved": requested_approved,
+        "resolution_error": resolution_error or None,
         "user_note": user_note,
+        "purpose": purpose,
+        "policy_id": approval_topic_ref["policy_id"] if approval_topic_ref else None,
+        "policy_version": approval_topic_ref["version"] if approval_topic_ref else None,
+        "approver_role": approver_role,
+        "proposal_id": proposal_id or None,
     })
     await send_event("approval_resolved", approved=approved, call_id=call_id)
 
@@ -820,6 +995,43 @@ async def _resolve_pending_approval(
     if pending_calls:
         return await _process_tool_calls(session, tool_functions, pending_calls, send_event, run_id)
     return False
+
+
+def _memory_subject_pairs(session: Session) -> list[dict]:
+    subjects = [{"subject_type": "actor", "subject_id": session.actor_id}]
+    customer_id = session.resolved_subjects.get("customer")
+    route_id = session.resolved_subjects.get("route")
+    if customer_id:
+        subjects.append({"subject_type": "customer", "subject_id": customer_id})
+    if route_id:
+        subjects.append({"subject_type": "route", "subject_id": route_id})
+    return subjects
+
+
+def _refresh_session_memories(session: Session) -> int:
+    """Recall newly resolved scopes and keep a bounded, serializable snapshot."""
+    subjects = _memory_subject_pairs(session)
+    subject_keys = {f"{item['subject_type']}:{item['subject_id']}" for item in subjects}
+    if subject_keys.issubset(set(session.memory_initialized_subjects)):
+        return 0
+    recalled = memory_store.retrieve_memories(subjects, task_context={"per_type_limit": 3}, limit=9)
+    by_id = {item["memory_id"]: item for item in session.recalled_memories}
+    for item in recalled:
+        by_id[item["memory_id"]] = item
+    session.recalled_memories = list(by_id.values())
+    session.memory_initialized_subjects = sorted(
+        set(session.memory_initialized_subjects) | subject_keys
+    )
+    return len(recalled)
+
+
+def _memory_extraction_subjects(session: Session) -> dict:
+    return {
+        "actor": session.actor_id,
+        "customer": session.resolved_subjects.get("customer"),
+        "company": session.resolved_subjects.get("company"),
+        "route": session.resolved_subjects.get("route"),
+    }
 
 
 async def _process_tool_calls(
@@ -842,13 +1054,52 @@ async def _process_tool_calls(
         args = tc["arguments"]
         call_id = tc["id"]
         await send_event("tool_call", name=name, arguments=args, call_id=call_id)
+        delegated_to = DELEGATION_TOOL_AGENTS.get(name)
+        if delegated_to:
+            await send_event(
+                "delegation_started",
+                from_agent=ORCHESTRATOR_AGENT,
+                to_agent=delegated_to,
+                tool_name=name,
+                call_id=call_id,
+            )
 
         if name == "request_human_approval":
+            skill = SKILL_BY_NAME.get(name)
+            if skill is not None and session.role not in skill.roles_allowed:
+                result = {
+                    "status": "permission_denied",
+                    "reason": (
+                        f"角色 '{session.role}' 无权调用 Skill '{name}'"
+                        f"（允许的角色：{list(skill.roles_allowed)}）。"
+                    ),
+                }
+                await send_event("tool_result", name=name, result=result, call_id=call_id)
+                session.action_log.append({"name": name, "args": args, "result": result})
+                session.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+                continue
+
             reason = args.get("reason", "")
             proposed_action = args.get("proposed_action", "")
-            await send_event("approval_request", reason=reason, proposed_action=proposed_action, call_id=call_id)
+            proposal_id = args.get("proposal_id", "")
+            await send_event(
+                "approval_request",
+                reason=reason,
+                proposed_action=proposed_action,
+                proposal_id=proposal_id or None,
+                call_id=call_id,
+            )
             session.lifecycle_state = "AWAITING_APPROVAL"
-            session.pending_approval = {"call_id": call_id, "reason": reason, "proposed_action": proposed_action}
+            session.pending_approval = {
+                "call_id": call_id,
+                "reason": reason,
+                "proposed_action": proposed_action,
+                "proposal_id": proposal_id,
+            }
             session.pending_tool_calls = tool_calls[i + 1:]
             await asyncio.to_thread(session_store.save_session, run_id, session)
             return True
@@ -858,12 +1109,71 @@ async def _process_tool_calls(
             result = {"status": "error", "message": f"未知工具：{name}"}
         else:
             try:
-                result = func(**args)
+                # Skill-level permission gate: same check used by harness.py's
+                # eval cases, so runtime and eval can never silently diverge
+                # on who is allowed to call a given Skill. Denied calls never
+                # reach the underlying func — no side effect is attempted.
+                result = wrap_with_permission_check(name, session.role, func, **args)
+                if inspect.isawaitable(result):
+                    result = await result
             except Exception as exc:  # noqa: BLE001
                 result = {"status": "error", "message": str(exc)}
 
         await send_event("tool_result", name=name, result=result, call_id=call_id)
+        if delegated_to:
+            delegation_status = (
+                "completed" if result.get("status") == "success" else "failed"
+            )
+            await send_event(
+                "delegation_completed",
+                from_agent=ORCHESTRATOR_AGENT,
+                to_agent=delegated_to,
+                delegation_status=delegation_status,
+                delegation_id=result.get("delegation_id"),
+                proposal_id=result.get("proposal_id"),
+                review_id=result.get("review_id"),
+                effective_decision=result.get("effective_decision"),
+                model_usage=result.get("model_usage", {}),
+                call_id=call_id,
+            )
+            if name == "delegate_policy_review" and result.get("status") == "success":
+                if result.get("conflict"):
+                    await send_event(
+                        "agent_conflict",
+                        proposal_id=result.get("proposal_id"),
+                        model_decision=result.get("model_decision"),
+                        runtime_decision=result.get("runtime_decision"),
+                        effective_decision=result.get("effective_decision"),
+                    )
+                if result.get("effective_decision") == "REQUIRE_APPROVAL":
+                    await send_event(
+                        "escalation_required",
+                        proposal_id=result.get("proposal_id"),
+                        review_id=result.get("review_id"),
+                        approver_roles=list(
+                            policy_store.get_approver_roles("hotel_over_budget_approval")
+                        ),
+                    )
         session.action_log.append({"name": name, "args": args, "result": result})
+
+        # Two-stage recall: actor preferences are loaded when a Session starts;
+        # customer preferences are loaded only after CRM returns a stable ID.
+        if name == "get_customer_info" and result.get("status") == "success":
+            customer_id = result.get("customer_id") or result.get("company_id")
+            if customer_id:
+                session.resolved_subjects.update({
+                    "customer": str(customer_id),
+                    "company": result.get("company", ""),
+                })
+                try:
+                    recalled_count = await asyncio.to_thread(_refresh_session_memories, session)
+                    if recalled_count:
+                        await send_event(
+                            "memory_recalled", subject_type="customer",
+                            subject_id=str(customer_id), count=recalled_count,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    await send_event("memory_recall_failed", text=str(exc))
 
         # Soft warning for repeated readonly calls with identical args
         if is_repeated_readonly_call(name, args, session.seen_readonly_calls):
@@ -919,10 +1229,23 @@ async def run_agent_loop(
         return
 
     tool_functions = AGENT.make_tool_functions(session)
+    # ``session.messages`` is the canonical history. Context strategies only
+    # create a per-model-call view and never replace or truncate it.
     messages = session.messages
 
     await send_event("goal", text=session.goal)
     await send_event("checklist", items=checklist, labels=CHECKLIST_LABELS)
+
+    try:
+        recalled_count = await asyncio.to_thread(_refresh_session_memories, session)
+        if recalled_count:
+            await send_event(
+                "memory_recalled", subject_type="actor",
+                subject_id=session.actor_id, count=recalled_count,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Recall is an optional context enhancement, never a task dependency.
+        await send_event("memory_recall_failed", text=str(exc))
 
     if resume_input is not None:
         kind = resume_input.get("kind")
@@ -935,17 +1258,50 @@ async def run_agent_loop(
             session.lifecycle_state = "RUNNING"
             messages.append({"role": "user", "content": text})
             await send_event("user_reply", text=text)
+            # An explicit correction should take effect cross-task immediately,
+            # even if the current task later pauses or fails.
+            try:
+                extracted = memory_store.extract_explicit_memories(
+                    [text], _memory_extraction_subjects(session), run_id
+                )
+                if any(item.get("is_correction") for item in extracted):
+                    written = await asyncio.to_thread(
+                        memory_store.persist_explicit_memories,
+                        [text], _memory_extraction_subjects(session), run_id,
+                    )
+                    if written:
+                        session.memory_initialized_subjects = []
+                        session.recalled_memories = []
+                        await asyncio.to_thread(_refresh_session_memories, session)
+                        await send_event("memory_written", count=len(written), timing="correction")
+            except Exception as exc:  # noqa: BLE001
+                await send_event("memory_write_failed", text=str(exc), timing="correction")
 
     while session.model_calls < MAX_TURNS:
         await send_event("thinking")
 
+        context_strategy = get_context_strategy()
+        context_build_started = time.perf_counter()
+        model_context = build_model_context(session, context_strategy)
+        context_build_latency_ms = (time.perf_counter() - context_build_started) * 1000
+        input_message_count = len(model_context)
+        estimated_context_tokens = estimate_context_tokens(model_context)
+        canonical_message_count = len(session.messages)
+        canonical_estimated_context_tokens = estimate_context_tokens(session.messages)
+        context_compacted = model_context != session.messages
+
         # Timeout retry: only for timeout errors, not quota errors
         timeout_retries = 0
+        model_latency_ms = 0.0
         exc: Exception | None = None
         message = usage_info = None
         while True:
             try:
-                message, usage_info = await asyncio.to_thread(_call_with_tools, messages)
+                model_call_started = time.perf_counter()
+                try:
+                    message, usage_info = await asyncio.to_thread(_call_with_tools, model_context)
+                finally:
+                    model_latency_ms += (time.perf_counter() - model_call_started) * 1000
                 exc = None
                 break
             except Exception as call_exc:  # noqa: BLE001
@@ -1004,8 +1360,18 @@ async def run_agent_loop(
                 await send_event("error", text=f"⚠️ 调用模型失败：{exc}")
             return
         session.model_calls += 1
-        if usage_info:
-            await send_event("usage", **usage_info)
+        await send_event(
+            "usage",
+            **(usage_info or {}),
+            context_strategy=context_strategy.value,
+            context_compacted=context_compacted,
+            input_message_count=input_message_count,
+            estimated_context_tokens=estimated_context_tokens,
+            canonical_message_count=canonical_message_count,
+            canonical_estimated_context_tokens=canonical_estimated_context_tokens,
+            model_latency_ms=round(model_latency_ms, 3),
+            context_build_latency_ms=round(context_build_latency_ms, 3),
+        )
 
         assistant_msg: dict = {"role": "assistant", "content": message.content or ""}
         if message.tool_calls:
@@ -1032,6 +1398,20 @@ async def run_agent_loop(
                     await send_event("error", text=f"⚠️ 生成最终报告失败：{exc}")
                 session.lifecycle_state = "DONE"
                 await asyncio.to_thread(session_store.save_session, run_id, session)
+                try:
+                    user_texts = [
+                        item.get("content", "") for item in session.messages
+                        if item.get("role") == "user" and isinstance(item.get("content"), str)
+                    ]
+                    written = await asyncio.to_thread(
+                        memory_store.persist_explicit_memories,
+                        user_texts, _memory_extraction_subjects(session), run_id,
+                    )
+                    if written:
+                        await send_event("memory_written", count=len(written), timing="post_run")
+                except Exception as exc:  # noqa: BLE001
+                    # A completed booking remains completed even when Memory IO fails.
+                    await send_event("memory_write_failed", text=str(exc), timing="post_run")
                 await send_event("done", model_used=_active_model["name"])
                 return
             else:
@@ -1071,6 +1451,35 @@ async def run_agent_loop(
     )
 
 
+@app.get("/api/memories")
+async def get_saved_memories(subject_type: str, subject_id: str, include_inactive: bool = False):
+    """List Memory records for one explicit entity scope."""
+    try:
+        records = await asyncio.to_thread(
+            memory_store.list_memories, subject_type, subject_id, include_inactive
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"memories": records}
+
+
+@app.delete("/api/memories/{memory_id}")
+async def delete_saved_memory(memory_id: str):
+    deleted = await asyncio.to_thread(memory_store.forget_memory, memory_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Memory not found or already deleted")
+    return {"deleted": True, "memory_id": memory_id}
+
+
+@app.delete("/api/memories")
+async def clear_saved_memories(subject_type: str, subject_id: str):
+    try:
+        count = await asyncio.to_thread(memory_store.clear_memories, subject_id, subject_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"deleted_count": count, "subject_type": subject_type, "subject_id": subject_id}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint: manages agent loop lifecycle.
@@ -1103,7 +1512,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 run_id = str(uuid.uuid4())
                 active_run_id = run_id
-                session = Session.new(goal, AGENT.system_prompt)
+                actor_id = (payload.get("actor_id") or "demo_employee").strip()
+                resolved_subjects = {}
+                origin = (payload.get("origin") or "").strip()
+                destination = (payload.get("destination") or "").strip()
+                if origin and destination:
+                    resolved_subjects["route"] = f"{origin.casefold()}->{destination.casefold()}"
+                session = Session.new(
+                    goal, AGENT.system_prompt,
+                    actor_id=actor_id,
+                    resolved_subjects=resolved_subjects,
+                )
                 current_task = asyncio.create_task(run_agent_loop(websocket, run_id, session))
 
             elif msg_type == "resume_task":
@@ -1147,6 +1566,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "kind": "approval",
                     "approved": bool(payload.get("approved")),
                     "user_note": (payload.get("user_note") or "").strip(),
+                    "approver_role": payload.get("approver_role"),
                 }
                 current_task = asyncio.create_task(
                     run_agent_loop(websocket, run_id, loaded, resume_input)

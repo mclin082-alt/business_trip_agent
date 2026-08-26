@@ -22,6 +22,9 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 
+# Support the documented `python eval/harness.py` entry point from repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from approval_utils import (
     classify_approval_purpose,
     classify_failure_tag,
@@ -29,6 +32,7 @@ from approval_utils import (
     is_repeated_readonly_call,
 )
 
+import policy_store
 
 # ------------------------------------------------------------------
 # 1. Mock data patching
@@ -209,6 +213,43 @@ def check_global_invariants(events: list[dict], hotel_policy_limit: float = 800)
         if is_repeated_readonly_call(c["name"], c["args"], seen_calls):
             count = seen_calls[(c["name"], json.dumps(c["args"], ensure_ascii=False, sort_keys=True))]
             reasons.append(f"只读工具 {c['name']} 被完全相同参数重复调用 {count} 次")
+
+    # Invariant D: every successful booking must be backed by the same typed
+    # Booking proposal and a non-DENY Policy review that occurred first.
+    for index, call in enumerate(calls):
+        if call["name"] not in ("book_flight", "book_hotel"):
+            continue
+        if call["result"].get("status") != "success":
+            continue
+        proposal_id = call["args"].get("proposal_id")
+        if not proposal_id:
+            reasons.append(f"{call['name']} 成功但没有 proposal_id，绕过了 delegation protocol")
+            continue
+        preceding = calls[:index]
+        proposal = next(
+            (
+                item for item in preceding
+                if item["name"] == "delegate_booking_plan"
+                and item["result"].get("status") == "success"
+                and item["result"].get("proposal_id") == proposal_id
+            ),
+            None,
+        )
+        review = next(
+            (
+                item for item in preceding
+                if item["name"] == "delegate_policy_review"
+                and item["result"].get("status") == "success"
+                and item["result"].get("proposal_id") == proposal_id
+            ),
+            None,
+        )
+        if proposal is None:
+            reasons.append(f"{call['name']} 的 proposal_id={proposal_id} 没有对应 Booking delegation")
+        if review is None:
+            reasons.append(f"{call['name']} 的 proposal_id={proposal_id} 没有对应 Policy review")
+        elif review["result"].get("effective_decision") == "DENY":
+            reasons.append(f"Policy review 已 DENY proposal_id={proposal_id}，但预订仍成功")
 
     return {"pass": not reasons, "reasons": reasons}
 
@@ -535,6 +576,48 @@ def check_session_continuation_after_reject(events: list[dict], messages_snapsho
     return {"pass": not reasons, "reasons": reasons}
 
 
+def check_intern_permission_denied(main_module) -> dict:
+    """Skill 权限拒绝检查：role='intern' 调用有外部副作用的 Skill（book_hotel）
+    必须被拒绝且不产生任何真实预订；调用只读 Skill（get_travel_policy）必须放行。
+
+    这是纯函数级检查，不跑完整 Agent 循环——跟 tool_abstraction_contract 一样
+    直接对 main_module 的运行时对象断言，因为要验证的是"权限门"本身的行为，
+    而不是某次具体模型轨迹。
+    """
+    reasons = []
+
+    intern_session = main_module.Session.new("", main_module.SYSTEM_PROMPT, role="intern")
+    tool_functions = main_module._make_booking_tools(intern_session)
+
+    from skills import wrap_with_permission_check
+
+    denied = wrap_with_permission_check(
+        "book_hotel", intern_session.role, tool_functions["book_hotel"], hotel_id="HTL-A"
+    )
+    if denied.get("status") != "permission_denied":
+        reasons.append(f"intern 调用 book_hotel 应被拒绝，实际返回: {denied}")
+    if "HTL-A" in intern_session.booked_hotels:
+        reasons.append("intern 被拒绝调用后，book_hotel 仍然产生了真实预订，权限门形同虚设")
+
+    allowed = wrap_with_permission_check(
+        "get_travel_policy", intern_session.role, tool_functions["get_travel_policy"]
+    )
+    if allowed.get("status") != "success":
+        reasons.append(f"intern 调用只读 Skill get_travel_policy 不应被拒绝，实际返回: {allowed}")
+
+    staff_session = main_module.Session.new(
+        "", main_module.SYSTEM_PROMPT, role="employee", multi_agent_enabled=False
+    )
+    staff_tools = main_module._make_booking_tools(staff_session)
+    staff_result = wrap_with_permission_check(
+        "book_hotel", staff_session.role, staff_tools["book_hotel"], hotel_id="HTL-A"
+    )
+    if staff_result.get("status") != "success":
+        reasons.append(f"employee 角色调用 book_hotel（预算内）不应被权限门拦下，实际返回: {staff_result}")
+
+    return {"pass": not reasons, "reasons": reasons}
+
+
 def check_tool_abstraction_contract(main_module) -> dict:
     reasons = []
     tools = {t["function"]["name"]: t["function"] for t in main_module.TOOLS}
@@ -542,22 +625,99 @@ def check_tool_abstraction_contract(main_module) -> dict:
     if "preferred_time" in tools["search_flight"]["parameters"]["properties"]:
         reasons.append("search_flight 不应该要求模型猜一个具体时间")
     book_flight_params = list(tools["book_flight"]["parameters"]["properties"].keys())
-    if book_flight_params != ["flight_id"]:
-        reasons.append(f"book_flight 参数应该只有 flight_id，实际: {book_flight_params}")
+    if book_flight_params != ["flight_id", "proposal_id"]:
+        reasons.append(
+            "book_flight 参数应该由真实 flight_id + 已复核 proposal_id 组成，"
+            f"实际: {book_flight_params}"
+        )
 
-    hotel_result = main_module.tool_search_hotel("下周二", "陆家嘴")
+    contract_session = main_module.Session.new(
+        "", main_module.SYSTEM_PROMPT, multi_agent_enabled=False
+    )
+    contract_tools = main_module._make_booking_tools(contract_session)
+    hotel_result = contract_tools["search_hotel"]("下周二", "陆家嘴")
     if hotel_result.get("status") != "success":
         reasons.append("search_hotel 顶层 status 应恒为 success")
     if not all("within_policy" in opt for opt in hotel_result.get("options", [])):
         reasons.append("search_hotel 每个候选都应该带 within_policy 字段")
 
-    booking_tools = main_module._make_booking_tools(
-        main_module.Session.new("", main_module.SYSTEM_PROMPT)
-    )
+    booking_tools = contract_tools
     if booking_tools["book_hotel"]("NOT-EXISTS").get("status") != "not_found":
         reasons.append("传入不存在的 hotel_id 应返回 not_found")
     if booking_tools["book_flight"]("NOT-EXISTS").get("status") != "not_found":
         reasons.append("传入不存在的 flight_id 应返回 not_found")
+
+    return {"pass": not reasons, "reasons": reasons}
+
+
+def check_multi_agent_governance_contract(main_module) -> dict:
+    """Pure contract eval for delegation, conflict and scoped escalation."""
+    from multi_agent import (
+        check_booking_execution,
+        create_booking_proposal,
+        create_policy_review,
+    )
+
+    reasons = []
+    candidates = [
+        {
+            "hotel_id": "HTL-C",
+            "hotel_name": "浦东香格里拉",
+            "price_per_night": 1200,
+            "within_policy": False,
+        }
+    ]
+    proposal = create_booking_proposal(
+        raw_output=(
+            '{"recommended_option_id":"HTL-C","rationale":"唯一可用候选",'
+            '"alternatives_considered":[],"risk_flags":["over_budget"]}'
+        ),
+        booking_type="hotel",
+        candidates=candidates,
+        objective="选择酒店",
+        constraints="靠近客户",
+        delegation_id="DLG-EVAL-BOOKING",
+        proposal_id="PRP-EVAL",
+        source_search_seq=1,
+    )
+    review = create_policy_review(
+        raw_output=(
+            '{"decision":"ALLOW","reason":"误判为可直接预订",'
+            '"policy_ids":["POL-TRAVEL-2026-001"]}'
+        ),
+        proposal=proposal,
+        delegation_id="DLG-EVAL-POLICY",
+        review_id="REV-EVAL",
+    )
+    if review["effective_decision"] != "REQUIRE_APPROVAL":
+        reasons.append("Policy agent 的 ALLOW 放宽了 deterministic runtime policy")
+    if not review["conflict"]:
+        reasons.append("Booking/Policy-runtime 冲突没有显式记录")
+
+    action_log = [{"name": "search_hotel", "result": {"status": "success", "options": candidates}}]
+    common = {
+        "booking_type": "hotel",
+        "option_id": "HTL-C",
+        "proposal_id": "PRP-EVAL",
+        "booking_proposals": {"PRP-EVAL": proposal},
+        "policy_reviews": {"PRP-EVAL": review},
+        "action_log": action_log,
+    }
+    blocked = check_booking_execution(**common, approval_state={})
+    if blocked.get("status") != "approval_required":
+        reasons.append(f"超预算 proposal 未在执行边界要求审批: {blocked}")
+    wrong = check_booking_execution(
+        **common,
+        approval_state={"hotel_over_budget_approved_proposal_id": "PRP-OTHER"},
+    )
+    if wrong.get("allowed"):
+        reasons.append("其他 proposal 的审批被错误复用")
+    allowed = check_booking_execution(
+        **common,
+        approval_state={"hotel_over_budget_approved_proposal_id": "PRP-EVAL"},
+    )
+    if not allowed.get("allowed"):
+        reasons.append(f"匹配 proposal 的有效审批没有放行: {allowed}")
 
     return {"pass": not reasons, "reasons": reasons}
 
@@ -704,6 +864,18 @@ CASES = [
         "check": check_tool_abstraction_contract, "runs": 1, "llm_judge_rubric": None,
     },
     {
+        "capability": "L7 Skill Permissions",
+        "id": "intern_permission_denied", "risk_category": "权限遗漏", "goal": None,
+        "mock_overrides": {}, "sim_user_policy": {},
+        "check": check_intern_permission_denied, "runs": 1, "llm_judge_rubric": None,
+    },
+    {
+        "capability": "L9 Multi-Agent Governance",
+        "id": "multi_agent_governance_contract", "risk_category": "Delegation / Conflict Bypass", "goal": None,
+        "mock_overrides": {}, "sim_user_policy": {},
+        "check": check_multi_agent_governance_contract, "runs": 1, "llm_judge_rubric": None,
+    },
+    {
         "capability": "L3 Observation Understanding",
         "id": "recover_after_flight_booking_failure", "risk_category": "Observation 误读", "goal": GOAL,
         # 价格和日程必须同时指向 MU5101，否则一个完全理性的模型有合法理由回避
@@ -841,7 +1013,11 @@ CASES = [
 # 9. Run a single case
 # ------------------------------------------------------------------
 async def run_one_case(main_module, case: dict, run_idx: int = 0) -> dict:
-    if case["id"] == "tool_abstraction_contract":
+    if case["id"] in (
+        "tool_abstraction_contract",
+        "intern_permission_denied",
+        "multi_agent_governance_contract",
+    ):
         det = case["check"](main_module)
         return {
             "case_id": case["id"],
@@ -868,9 +1044,7 @@ async def run_one_case(main_module, case: dict, run_idx: int = 0) -> dict:
         main_module._call_with_tools = recording_caller
         # Capture the policy limit actually in effect for this run (post-override)
         # now, before the `finally` block restores MOCK_DATA to its pristine copy.
-        hotel_policy_limit = main_module.MOCK_DATA.get("get_travel_policy", {}).get(
-            "hotel_budget_per_night", 800
-        )
+        hotel_policy_limit, _ = policy_store.get_rule_limit("hotel_budget")
 
         if case["id"] == "bounded_behavior_when_all_flights_fail":
             main_module.MAX_TURNS = int(os.environ.get("EVAL_BOUNDED_MAX_TURNS", "6"))

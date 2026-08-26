@@ -2,21 +2,28 @@
 Tests for session_store.py: Session serialization round-trip.
 
 Run:
-    SESSION_STORE_PATH=/tmp/test_sessions_phase1.db python3 -m pytest test_session_store.py -v
+    SESSION_STORE_PATH=/tmp/test_sessions_phase1.db python3 -m pytest tests/test_session_store.py -v
 """
 
 import dataclasses
+import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
 TEST_DB_PATH = os.environ.get("SESSION_STORE_PATH") or "/tmp/test_sessions_phase1.db"
 os.environ["SESSION_STORE_PATH"] = TEST_DB_PATH
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import session_store  # noqa: E402
 from main import Session  # noqa: E402
+
+# Other test modules may have imported session_store before this module set
+# the environment variable. Keep this module's direct SQLite setup and the
+# persistence functions pointed at the same isolated database.
+session_store.SESSION_STORE_PATH = TEST_DB_PATH
 
 
 def _make_nondefault_session() -> Session:
@@ -83,6 +90,32 @@ def _make_nondefault_session() -> Session:
             ("search_flight", '{"date": "下周二"}'): 2,
             ("get_travel_policy", "{}"): 1,
         },
+        multi_agent_enabled=True,
+        subagent_model_calls=2,
+        delegation_records=[
+            {
+                "delegation_id": "DLG-1",
+                "from_agent": "trip_orchestrator",
+                "to_agent": "booking_subagent",
+                "status": "completed",
+                "output_ref": "PRP-1",
+            }
+        ],
+        booking_proposals={
+            "PRP-1": {
+                "proposal_id": "PRP-1",
+                "booking_type": "hotel",
+                "recommended_option_id": "HTL-A",
+                "context_digest": "digest-1",
+            }
+        },
+        policy_reviews={
+            "PRP-1": {
+                "review_id": "REV-1",
+                "proposal_id": "PRP-1",
+                "effective_decision": "ALLOW",
+            }
+        },
     )
 
 
@@ -144,6 +177,72 @@ def test_plain_json_types_no_custom_encoder_needed():
     back = json.loads(raw)
     assert back["model_calls"] == 5
     assert back["lifecycle_state"] == "AWAITING_APPROVAL"
+
+
+def test_load_legacy_session_without_schema_version():
+    """A Session written before schema versioning should still load."""
+    session = _make_nondefault_session()
+    legacy = dataclasses.asdict(session)
+    legacy.pop("schema_version")
+    legacy.pop("connector_context")
+    legacy.pop("delegation_records")
+    legacy.pop("booking_proposals")
+    legacy.pop("policy_reviews")
+    legacy.pop("subagent_model_calls")
+    legacy.pop("multi_agent_enabled")
+    legacy["seen_readonly_calls"] = session_store._encode_seen_readonly_calls(
+        legacy["seen_readonly_calls"]
+    )
+
+    conn = sqlite3.connect(TEST_DB_PATH)
+    try:
+        conn.execute(session_store._CREATE_TABLE_SQL)
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions "
+            "(run_id, session_json, lifecycle_state, updated_at) VALUES (?, ?, ?, ?)",
+            ("legacy-run", json.dumps(legacy), legacy["lifecycle_state"], "2026-01-01T00:00:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    loaded = session_store.load_session("legacy-run")
+    assert loaded is not None
+    assert loaded.schema_version == session_store.CURRENT_SESSION_SCHEMA_VERSION
+    assert loaded.connector_context == {}
+    assert loaded.delegation_records == []
+    assert loaded.booking_proposals == {}
+    assert loaded.policy_reviews == {}
+    assert loaded.multi_agent_enabled is False
+    assert loaded.messages == session.messages
+
+
+def test_rejects_session_from_newer_schema():
+    session = _make_nondefault_session()
+    payload = dataclasses.asdict(session)
+    payload["schema_version"] = session_store.CURRENT_SESSION_SCHEMA_VERSION + 1
+    payload["seen_readonly_calls"] = session_store._encode_seen_readonly_calls(
+        payload["seen_readonly_calls"]
+    )
+
+    conn = sqlite3.connect(TEST_DB_PATH)
+    try:
+        conn.execute(session_store._CREATE_TABLE_SQL)
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions "
+            "(run_id, session_json, lifecycle_state, updated_at) VALUES (?, ?, ?, ?)",
+            ("future-run", json.dumps(payload), payload["lifecycle_state"], "2026-01-01T00:00:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        session_store.load_session("future-run")
+    except ValueError as exc:
+        assert "newer than supported" in str(exc)
+    else:
+        raise AssertionError("A future Session schema should not be loaded silently")
 
 
 if __name__ == "__main__":
