@@ -1,5 +1,7 @@
 # AI Product Quality & Evaluation Framework — Business Trip Execution Agent
 
+> 验证口径：本文的 12 个 case、默认 26 次运行和维度勾选描述评测设计/覆盖，不是本次通过率。2026-10-14 仅复跑 35 项离线测试；完整模型 Eval 与真实日历未执行，见 [验证记录](../docs/VERIFICATION.md)。
+
 > 本文是给招聘 Leader 的可选深挖材料，回答“如何定义这个 Agent 做得好不好，以及如何系统性发现它做得不好的地方”。项目总览见 [`../README.md`](../README.md)，产品与系统设计见 [`../DESIGN.md`](../DESIGN.md)。对应实现是 `eval/harness.py`、`eval/replay_harness.py`、`approval_utils.py` 和独立 contract tests。
 
 ---
